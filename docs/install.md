@@ -49,8 +49,8 @@ your `LD_LIBRARY_PATH`
 Afer building it move `awssdk.<platform>.[so|dll]` into your module directory, under `kx`. The following example assumes the default install location for KDB-X.
 
 ```bash
-git clone TODO
-cd TODO
+git clone https://github.com/KxSystems/awssdk/
+cd awssdk
 export INSTALL_PATH=$(pwd)/out/kx
 mkdir build
 cd build
