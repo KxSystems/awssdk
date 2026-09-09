@@ -1,11 +1,12 @@
-#include "aws_session.h"
-
 #include <cctype>
 #include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <string>
 
+#include <aws/core/platform/FileSystem.h>
+
+#include "aws_session.h"
 #include "utils.h"
 
 namespace awssdk {
@@ -51,6 +52,28 @@ bool AwsSession::initialize(K options_k) {
     throw std::invalid_argument("loglevel");
   }
   options.loggingOptions.logLevel = log_level;
+  if (log_level != Aws::Utils::Logging::LogLevel::Off) {
+    // in case it was initialized and shut down before
+    log_prefix.clear();
+    options.loggingOptions.defaultLogPrefix = Aws::DEFAULT_LOG_PREFIX;
+
+    switch (dict_find_str(options_k, "logPrefix", log_prefix)) {
+      case DictLookup::Absent:
+        break;
+      case DictLookup::WrongType:
+        throw std::invalid_argument("type");
+      case DictLookup::Found:
+        const auto sep = log_prefix.find_last_of("/\\");
+        if (sep != std::string::npos) {
+          const std::string dir = log_prefix.substr(0, sep);
+          if (!Aws::FileSystem::CreateDirectoryIfNotExists(dir.c_str(), true)) {
+            throw std::runtime_error("logPrefix");
+          }
+        }
+        options.loggingOptions.defaultLogPrefix = log_prefix.c_str();
+        break;
+    }
+  }
   Aws::InitAPI(options);
   initialized = true;
   if (!atexit_registered) {

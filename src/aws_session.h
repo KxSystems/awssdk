@@ -14,6 +14,7 @@ namespace awssdk {
 class AwsSession {
   private:
     Aws::SDKOptions options;
+    std::string log_prefix;
     bool initialized = false;
     bool atexit_registered = false;
 

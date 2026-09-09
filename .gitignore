@@ -1,3 +1,6 @@
 build/
 out/
 *.valgrind
+aws_sdk*.log
+test_log/
+report.xml
