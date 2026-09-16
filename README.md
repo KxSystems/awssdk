@@ -4,6 +4,9 @@ This project is a Kdb-x module that wraps official AWS sdk.
 
 ## Features
 
+- AWS credential resolution via the official AWS authentication chain
+- S3 client creation
+
 ## API Documentation
 
 :point_right: [`API reference`](docs/reference.md)

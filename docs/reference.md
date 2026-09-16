@@ -41,3 +41,95 @@ Fetches AWS credentials using the official AWS authentication chain.
 ```q
 credentials: sdk.getCredentials[::]
 ```
+
+## createClient
+
+Creates an S3 client, used by the other S3 functions. Requires [`initialize`](#initialize) to
+have been called.
+
+Credentials are resolved through the same default AWS chain as
+[`getCredentials`](#getcredentials), unless `noSignRequest`, `credentials` or `profile` is set.
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|options|dict|Options for the client, or `::` for the defaults|
+
+**Options:**
+
+|Name|Type|Default|Description|
+|---|---|---|---|
+|region|string\|symbol|`"aws-global"`|AWS region to use|
+|endpointUrl|string|none|Override the endpoint, e.g. for a MinIO or other S3-compatible server|
+|virtualAddressing|boolean\|long|`1b`|Use virtual-hosted-style addressing. Set to `0b` for path-style, which S3-compatible servers usually need|
+|noSignRequest|boolean\|long|`0b`|Do not use credentials or sign requests, for reading public buckets. The equivalent of the AWS CLI's `--no-sign-request`. Takes precedence: `credentials` and `profile` are ignored when it is set|
+|credentials|string|none|Path to an AWS credentials file, e.g. a mounted secret. Read once, when the client is created|
+|profile|string|`"default"`|Profile to read from `credentials`. Requires `credentials`|
+|caFile|string|SDK default|Path to a CA certificate bundle|
+|caPath|string|SDK default|Directory of CA certificates|
+|verifySsl|boolean\|long|`1b`|Verify the server's TLS certificate|
+|connectTimeout|long|`5000`|Connection timeout in milliseconds. At least 1, up to the platform's `long` maximum|
+|requestTimeout|long|`5000`|Inactivity timeout in milliseconds, **not** a cap on total request duration. See the note below|
+|maxConnections|long|`25`|Maximum concurrent HTTP connections, 1 to 4294967295|
+
+An unrecognised option name is an error rather than being ignored, so a mis-spelling is reported
+instead of silently taking the default.
+
+`requestTimeout` does not limit how long a request may take. It maps to the SDK's
+`requestTimeoutMs`, which under libcurl is the *low-speed time*: a transfer is aborted only once it
+has stayed below roughly 1 byte/second for that long. A large download that keeps making progress
+is not affected by the 5000ms default, however long it runs. Two consequences worth knowing:
+
+- libcurl rounds the value down to whole seconds, except that a value between 1 and 999 becomes one
+  second, so sub-second precision is not meaningful.
+- `0` disables the low-speed check under libcurl. On the Windows HTTP clients, where this value is a
+  socket read timeout instead, `0` is documented as unspecified behaviour.
+
+The SDK's whole-request timeout is a different field (`httpRequestTimeoutMs`, `CURLOPT_TIMEOUT_MS`),
+which this module leaves at the SDK default of no limit and does not currently expose.
+
+A count or duration too large for the field the SDK stores it in is rejected rather than wrapped,
+so an out-of-range value never silently becomes a small or zero one. The timeout ceiling is the
+platform's `long` maximum, which is smaller on Windows than on Linux and macOS.
+
+`connectTimeout`, `requestTimeout` and `maxConnections` default to the same values the `awss3kdb`
+module used, which for the two timeouts differs from the AWS SDK's own defaults of 1000ms and no
+limit. TLS and connection options apply whether or not the request is signed.
+
+Credentials given through `credentials` are read once, when the client is created, so later edits
+to that file do not reach an existing client. That suits fixed keys; rotating or expiring temporary
+credentials would need a new client. `profile` without `credentials` is an error rather than being
+ignored — to pick a profile from the standard locations, set `AWS_PROFILE` and let the default
+chain resolve it. The one exception is `noSignRequest`, which discards credential selection
+entirely: with it set, `credentials` and `profile` are ignored rather than rejected.
+
+When `credentials` is given without `profile`, the `default` profile is used; if the file has no
+`default` profile but holds exactly one profile, that one is used. A file with several profiles and
+no `default` is an error rather than a guess. A `credentials` path that cannot be read or parsed is
+an error, rather than falling back to the default credential chain.
+
+**Returns:** a foreign object holding the client. It is garbage collected when its refcount drops
+to zero, and is invalidated by [`shutDown`](#shutdown). A handle that outlives a `shutDown` becomes
+inert: it can be held and dropped safely, but it never refers to a client created afterwards.
+
+
+**Example:**
+
+```q
+client: sdk.createClient[::]  // defaults
+
+client: sdk.createClient[([region: "eu-west-1"])]
+
+// an S3-compatible server, which needs path-style addressing
+client: sdk.createClient[([endpointUrl: "http://localhost:9000"; virtualAddressing: 0b])]
+
+// a public bucket, no credentials
+client: sdk.createClient[([region: "eu-west-1"; noSignRequest: 1b])]
+
+// credentials from a mounted secret, selecting a named profile
+client: sdk.createClient[([credentials: "/etc/secret/credentials"; profile: "readonly"])]
+
+// a long-running download: no request timeout, more connections
+client: sdk.createClient[([region: "eu-west-1"; requestTimeout: 0; maxConnections: 100])]
+```

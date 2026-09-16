@@ -2,6 +2,7 @@
 // macros would otherwise break them.
 #include "aws_session.h"
 #include "aws_credentials.h"
+#include "s3_client.h"
 #include "k.h"
 
 #ifdef _WIN32
@@ -18,6 +19,7 @@ extern "C" {
     ADD_FN(initialize, 1)
     ADD_FN(shutDown, 1)
     ADD_FN(getCredentials, 1)
+    ADD_FN(createClient, 1)
     return xD(keys, values);
   }
 }
