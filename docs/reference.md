@@ -34,10 +34,10 @@ sdk.shutDown[::]
 
 ## getCredentials
 
-Fetches AWS credentials using the official AWS authentiaction chain.
+Fetches AWS credentials using the official AWS authentication chain.
 
 **Example:**
 
 ```q
-sdk.shutDown[::]
+credentials: sdk.getCredentials[::]
 ```
