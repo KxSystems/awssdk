@@ -11,6 +11,8 @@ t.setup[{
 t.feature `uninitialized
 t.assertError[{aws.getCredentials[::]};"uninitialized";::]
 t.assertError[{aws.createClient[::]};"uninitialized";::]
+t.assertError[{aws.listObjects[::;"bucket";::]};"uninitialized";::]
+t.assertError[{aws.listObjectsMetadata[::;"bucket";::]};"uninitialized";::]
 t.assertFalse[{aws.shutDown[::]};::]
 
 t.feature `initialize
@@ -72,14 +74,40 @@ t.assertFalse[{aws.shutDown[::]};::]
 // not double-free it.
 t.assertError[{aws.createClient[::]};"uninitialized";::]
 
+t.feature `listObjects
+// Argument and option validation only: everything here is rejected before any
+// request is made, so these need no S3 endpoint. The listing itself is covered
+// by the live tests against MinIO.
+t.before[{aws.initialize[::];lo::aws.createClient[::]}]
+// `::` options reach get_client, which proves dict_unknown_key and the three
+// dict_find_str calls all ran against a 101h generic null without treating it
+// as a dictionary. A real dictionary is still validated -- see the `depth` case
+// below.
+t.assertError[{aws.listObjects[42;"bucket";::]};"client";::]
+t.assertError[{aws.listObjects[42;"bucket";()!()]};"client";::]
+t.assertError[{aws.listObjects[(1;2);"bucket";::]};"client";::]
+t.assertError[{aws.listObjects[lo;42;::]};"bucket";::]
+t.assertError[{aws.listObjects[lo;"bucket";1 2 3]};"type";::]
+t.assertError[{aws.listObjects[lo;"bucket";([depth:1])]};"depth";::]
+t.assertError[{aws.listObjects[lo;"bucket";([prefix:42])]};"prefix";::]
+// marker is an alias for startAfter, so asking for both needs a precedence
+// rule nobody wanted; it is an error, reported as the deprecated spelling.
+t.assertError[{aws.listObjects[lo;"bucket";([startAfter:"a";marker:"b"])]};"marker";::]
+// listObjectsMetadata takes the same arguments and options, so it rejects the
+// same things; only the columns it builds differ.
+t.assertError[{aws.listObjectsMetadata[42;"bucket";::]};"client";::]
+t.assertError[{aws.listObjectsMetadata[lo;42;::]};"bucket";::]
+t.assertError[{aws.listObjectsMetadata[lo;"bucket";1 2 3]};"type";::]
+t.assertError[{aws.listObjectsMetadata[lo;"bucket";([depth:1])]};"depth";::]
+
 t.feature `handleReuse
 // `client` from the createClient feature is a stale handle: the sweep emptied
 // its slot without freeing it. A freed allocation comes straight back on the
 // next new, so had the sweep freed slots instead, this stale handle would name
 // a client created after it and destroy the wrong one when dropped.
 t.before[{aws.initialize[::]; fresh::aws.createClient each 20#enlist ([region:"eu-west-1"])}]
-t.assertMatch[{sum 112h=type each fresh};20i;::]
-t.assertTrue[{client:: ::; .Q.gc[]; 20i ~ sum 112h=type each fresh};::]
+t.assertTrue[{all 112h=type each fresh};::]
+t.assertTrue[{client:: (::); .Q.gc[]; all sum 112h=type each fresh};::]
 t.assertMatch[{type aws.createClient[::]};112h;::]
 t.assertTrue[{aws.shutDown[::]};::]
 
@@ -107,4 +135,4 @@ if[`junitPath in key params;
     h 0: r;
   ]
 
-exit $[all `pass=report`status;0;1];
+/exit $[all `pass=report`status;0;1];

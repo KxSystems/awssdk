@@ -1,4 +1,5 @@
 #include <cstring>
+#include <stdexcept>
 
 #include "utils.h"
 
@@ -23,11 +24,23 @@ DictLookup dict_find_str(K dict, const char * key, std::string & out) {
         out.assign(kS(vals)[i]);
         return DictLookup::Found;
     }
+    // A one-character string is a char *atom* in q, so a dictionary whose
+    // values are all such strings -- ([prefix:"a";marker:"b"]) -- has a char
+    // vector for its value list, one character per key. Without this a
+    // single-character option value would be rejected as the wrong type.
+    if (vals->t == KC) {
+        out.assign(1, kC(vals)[i]);
+        return DictLookup::Found;
+    }
     if (vals->t != 0) { return DictLookup::WrongType; }
 
     K val = kK(vals)[i];  // mixed value list, one element per key
     if (val->t == KC) {
         out.assign((S)kC(val), val->n);
+        return DictLookup::Found;
+    }
+    if (val->t == -KC) {  // the same one-character case, in a mixed list
+        out.assign(1, val->g);
         return DictLookup::Found;
     }
     if (val->t == -KS) {
@@ -81,4 +94,22 @@ const char * dict_unknown_key(K dict, const char * const * allowed, size_t n) {
         if (!ok) { return kS(keys)[i]; }
     }
     return nullptr;
+}
+
+void dict_require_type(DictLookup lookup, const char * key) {
+    if (lookup == DictLookup::WrongType) { throw std::invalid_argument(key); }
+}
+
+bool k_to_str(K arg, std::string & out) {
+    if (arg == nullptr) { return false; }
+    if (arg->t == KC) { out.assign((S)kC(arg), arg->n); return true; }
+    if (arg->t == -KC) { out.assign(1, arg->g); return true; }  // "b" is an atom
+    if (arg->t == -KS) { out.assign(arg->s); return true; }
+    return false;
+}
+
+K krr_text(const std::string & message) {
+    static thread_local std::string held;
+    held = message;
+    return krr((S)held.c_str());
 }

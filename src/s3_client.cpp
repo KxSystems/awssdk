@@ -71,22 +71,17 @@ K destroy_client(K client) {
     return (K)0;
 }
 
-// Reports a bad option value using the option's own name as the error text,
-// matching how initialize reports a bad `loglevel`.
-void require(DictLookup lookup, const char * key) {
-    if (lookup == DictLookup::WrongType) { throw std::invalid_argument(key); }
-}
-
-// Reads a count or a millisecond duration. `floor` is the lowest accepted
-// value: 0 for a timeout that means "no limit", 1 for a count. `ceiling` is
+// Reads a count or a millisecond duration and holds it to a range. `floor` is
+// the lowest accepted value: 0 for a timeout that means "no limit", 1 for a
+// count. `ceiling` is
 // the largest value the destination field can hold: a q long is 64-bit, so
 // without this check the narrowing conversion would wrap silently, and
 // maxConnections of 2^32 would land as 0 connections rather than being
 // rejected. The timeouts' ceiling is platform-dependent, because the SDK
 // stores them in a `long` -- 64-bit here, 32-bit on Windows.
-J require_long(K options, const char * key, J fallback, J floor, J ceiling) {
+J bounded_long(K options, const char * key, J fallback, J floor, J ceiling) {
     J value = fallback;
-    require(dict_find_long(options, key, value), key);
+    dict_require_type(dict_find_long(options, key, value), key);
     if (value < floor || value > ceiling) { throw std::invalid_argument(key); }
     return value;
 }
@@ -120,7 +115,7 @@ K createClient(K options) {
         Aws::Client::ClientConfiguration config;
 
         std::string region = Aws::Region::AWS_GLOBAL;
-        require(dict_find_str(options, "region", region), "region");
+        dict_require_type(dict_find_str(options, "region", region), "region");
         // Assigned as C strings throughout: the SDK's container aliases are
         // only the std:: ones while USE_AWS_MEMORY_MANAGEMENT is off. With it on,
         // Aws::String is a distinct type and a std::string would not convert.
@@ -128,31 +123,31 @@ K createClient(K options) {
 
         std::string endpoint_url;
         const DictLookup endpoint = dict_find_str(options, "endpointUrl", endpoint_url);
-        require(endpoint, "endpointUrl");
+        dict_require_type(endpoint, "endpointUrl");
         if (endpoint == DictLookup::Found) { config.endpointOverride = endpoint_url.c_str(); }
 
         bool virtual_addressing = true;
-        require(dict_find_bool(options, "virtualAddressing", virtual_addressing),
+        dict_require_type(dict_find_bool(options, "virtualAddressing", virtual_addressing),
             "virtualAddressing");
 
         bool no_sign_request = false;
-        require(dict_find_bool(options, "noSignRequest", no_sign_request),
+        dict_require_type(dict_find_bool(options, "noSignRequest", no_sign_request),
             "noSignRequest");
 
         // TLS and connection settings apply whether or not the request is
         // signed: a public bucket still gets fetched over HTTPS.
         std::string ca_file;
         const DictLookup ca = dict_find_str(options, "caFile", ca_file);
-        require(ca, "caFile");
+        dict_require_type(ca, "caFile");
         if (ca == DictLookup::Found) { config.caFile = ca_file.c_str(); }
 
         std::string ca_path;
         const DictLookup ca_dir = dict_find_str(options, "caPath", ca_path);
-        require(ca_dir, "caPath");
+        dict_require_type(ca_dir, "caPath");
         if (ca_dir == DictLookup::Found) { config.caPath = ca_path.c_str(); }
 
         bool verify_ssl = true;
-        require(dict_find_bool(options, "verifySsl", verify_ssl), "verifySsl");
+        dict_require_type(dict_find_bool(options, "verifySsl", verify_ssl), "verifySsl");
         config.verifySSL = verify_ssl;
 
         // Defaults are awss3kdb's, not the SDK's (1000ms connect, no request
@@ -163,20 +158,20 @@ K createClient(K options) {
         // lowSpeedLimit (1 byte/s) for that long, rounded to whole seconds. So
         // it never cuts off a progressing transfer. The whole-request
         // equivalent, httpRequestTimeoutMs, is left at the SDK's no-limit.
-        config.connectTimeoutMs = static_cast<long>(require_long(options,
+        config.connectTimeoutMs = static_cast<long>(bounded_long(options,
             "connectTimeout", 5 * 1000, 1, LONG_FIELD_MAX));
-        config.requestTimeoutMs = static_cast<long>(require_long(options,
+        config.requestTimeoutMs = static_cast<long>(bounded_long(options,
             "requestTimeout", 5 * 1000, 0, LONG_FIELD_MAX));
-        config.maxConnections = static_cast<unsigned>(require_long(options,
+        config.maxConnections = static_cast<unsigned>(bounded_long(options,
             "maxConnections", 25, 1, UNSIGNED_FIELD_MAX));
 
         std::string credentials_file;
         const DictLookup creds = dict_find_str(options, "credentials", credentials_file);
-        require(creds, "credentials");
+        dict_require_type(creds, "credentials");
 
         std::string profile = "default";
         const DictLookup named = dict_find_str(options, "profile", profile);
-        require(named, "profile");
+        dict_require_type(named, "profile");
         // profile selects within `credentials`. On its own there is nothing for
         // it to select from, and falling through to the default chain would
         // ignore it silently; AWS_PROFILE is how that case is expressed.

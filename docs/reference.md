@@ -133,3 +133,102 @@ client: sdk.createClient[([credentials: "/etc/secret/credentials"; profile: "rea
 // a long-running download: no request timeout, more connections
 client: sdk.createClient[([region: "eu-west-1"; requestTimeout: 0; maxConnections: 100])]
 ```
+
+## listObjects
+
+Lists the objects in a bucket. Requires [`initialize`](#initialize) and a client from
+[`createClient`](#createclient).
+
+Every page is fetched, so the result is the complete listing however large it is.
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|client|foreign|A client from [`createClient`](#createclient)|
+|bucket|string\|symbol|Bucket to list|
+|options|dict|Options, or `::` for none|
+
+**Options:**
+
+|Name|Type|Default|Description|
+|---|---|---|---|
+|prefix|string\|symbol|none|List only keys beginning with this prefix|
+|startAfter|string\|symbol|none|List only keys ordered after this one, exclusive|
+
+**Returns:** a keyed table of `objectKey` to `size`, where `objectKey` is the object key as a
+string and `size` its size in bytes. An empty bucket gives a keyed table with no rows.
+
+The column is `objectKey`, not `key`, because `key` is a reserved word in q: a column of that name
+cannot appear in a table literal, and `where key = ...` silently matches nothing instead of
+erroring.
+
+Errors from S3 itself carry the service's own text, for example
+`` `NoSuchBucket: The specified bucket does not exist ``, rather than the short tokens used to
+report a bad argument or option.
+
+**Example:**
+
+```q
+client: sdk.createClient[([region: "eu-west-1"])]
+
+listing: sdk.listObjects[client; "my-bucket"; ::]
+listing: sdk.listObjects[client; "my-bucket"; ([prefix: "data/2026/"])]
+
+// resume after a key already seen
+listing: sdk.listObjects[client; "my-bucket";
+    ([prefix: "data/2026/"; startAfter: "data/2026/part-0.parquet"])]
+
+// the size of one object, indexed by its key
+listing["data/2026/part-0.parquet"]`size
+
+// as a plain table
+0!listing
+```
+
+## listObjectsMetadata
+
+Lists the objects in a bucket with the metadata the listing carries, rather than size alone. Takes
+the same arguments and options as [`listObjects`](#listobjects), and costs the same — the extra
+columns come from the same request, not from a call per object.
+
+**Parameters** and **Options** are exactly those of [`listObjects`](#listobjects): `prefix` and
+`startAfter`.
+
+**Returns:** a keyed table of `objectKey` to:
+
+|Column|Type|Description|
+|---|---|---|
+|size|long|Size in bytes|
+|lastModified|timestamp|When the object was last written. Null if the service did not report it|
+|eTag|string|The object's ETag, with S3's surrounding double quotes removed. Not necessarily an MD5 digest — multipart uploads and some encryption modes produce values that cannot be compared against one computed locally|
+|storageClass|symbol|`` `STANDARD ``, `` `GLACIER ``, and so on|
+|ownerId|string|Owner's canonical ID|
+
+The key column is the same as [`listObjects`](#listobjects)', so this is a superset: code written
+as ``listing[objectKey]`size`` works against either function.
+
+`ownerId` needs no extra request, only a larger response on the same one. Some S3-compatible
+servers, MinIO among them, leave it empty. The owner display name is not exposed: AWS S3 generally
+no longer returns one.
+
+Metadata that the listing API cannot provide — content type, content encoding, version id, and
+user-defined `x-amz-meta-*` pairs — is not available here. Those require a per-object request and
+are not currently exposed.
+
+**Example:**
+
+```q
+client: sdk.createClient[([region: "eu-west-1"])]
+
+listing: sdk.listObjectsMetadata[client; "my-bucket"; ([prefix: "data/2026/"])]
+
+// objects written in the last day
+select from 0!listing where lastModified > .z.p - 1D
+
+// total bytes under the prefix
+exec sum size from listing
+
+// anything not on standard storage
+select from 0!listing where not storageClass = `STANDARD
+```

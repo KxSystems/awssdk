@@ -6,6 +6,7 @@ This project is a Kdb-x module that wraps official AWS sdk.
 
 - AWS credential resolution via the official AWS authentication chain
 - S3 client creation
+- Listing S3 objects, with or without object metadata
 
 ## API Documentation
 
