@@ -135,4 +135,4 @@ if[`junitPath in key params;
     h 0: r;
   ]
 
-/exit $[all `pass=report`status;0;1];
+exit $[all `pass=report`status;0;1];
