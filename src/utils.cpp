@@ -1,4 +1,5 @@
 #include <cstring>
+#include <stdexcept>
 
 #include "utils.h"
 
@@ -23,6 +24,14 @@ DictLookup dict_find_str(K dict, const char * key, std::string & out) {
         out.assign(kS(vals)[i]);
         return DictLookup::Found;
     }
+    // A one-character string is a char *atom* in q, so a dictionary whose
+    // values are all such strings -- ([prefix:"a";marker:"b"]) -- has a char
+    // vector for its value list, one character per key. Without this a
+    // single-character option value would be rejected as the wrong type.
+    if (vals->t == KC) {
+        out.assign(1, kC(vals)[i]);
+        return DictLookup::Found;
+    }
     if (vals->t != 0) { return DictLookup::WrongType; }
 
     K val = kK(vals)[i];  // mixed value list, one element per key
@@ -30,9 +39,77 @@ DictLookup dict_find_str(K dict, const char * key, std::string & out) {
         out.assign((S)kC(val), val->n);
         return DictLookup::Found;
     }
+    if (val->t == -KC) {  // the same one-character case, in a mixed list
+        out.assign(1, val->g);
+        return DictLookup::Found;
+    }
     if (val->t == -KS) {
         out.assign(val->s);
         return DictLookup::Found;
     }
     return DictLookup::WrongType;
+}
+
+DictLookup dict_find_long(K dict, const char * key, J & out) {
+    const J i = dict_find_idx(dict, key);
+    if (i < 0) { return DictLookup::Absent; }
+
+    K vals = kK(dict)[1];
+    switch (vals->t) {  // typed value list, e.g. `connectTimeout`maxConnections!1000 25
+        case KB: out = kG(vals)[i]; return DictLookup::Found;
+        case KH: out = kH(vals)[i]; return DictLookup::Found;
+        case KI: out = kI(vals)[i]; return DictLookup::Found;
+        case KJ: out = kJ(vals)[i]; return DictLookup::Found;
+        case 0: break;  // mixed value list, handled below
+        default: return DictLookup::WrongType;
+    }
+
+    K val = kK(vals)[i];  // mixed value list, one element per key
+    switch (val->t) {
+        case -KB: out = val->g; return DictLookup::Found;
+        case -KH: out = val->h; return DictLookup::Found;
+        case -KI: out = val->i; return DictLookup::Found;
+        case -KJ: out = val->j; return DictLookup::Found;
+        default: return DictLookup::WrongType;
+    }
+}
+
+DictLookup dict_find_bool(K dict, const char * key, bool & out) {
+    J value = 0;
+    const DictLookup lookup = dict_find_long(dict, key, value);
+    if (lookup == DictLookup::Found) { out = (value != 0); }
+    return lookup;
+}
+
+const char * dict_unknown_key(K dict, const char * const * allowed, size_t n) {
+    if (dict == nullptr || dict->t != XD) { return nullptr; }
+    K keys = kK(dict)[0];
+    if (keys->t != KS) { return nullptr; }
+
+    for (J i = 0; i < keys->n; ++i) {
+        bool ok = false;
+        for (size_t j = 0; j < n && !ok; ++j) {
+            ok = 0 == std::strcmp(allowed[j], kS(keys)[i]);
+        }
+        if (!ok) { return kS(keys)[i]; }
+    }
+    return nullptr;
+}
+
+void dict_require_type(DictLookup lookup, const char * key) {
+    if (lookup == DictLookup::WrongType) { throw std::invalid_argument(key); }
+}
+
+bool k_to_str(K arg, std::string & out) {
+    if (arg == nullptr) { return false; }
+    if (arg->t == KC) { out.assign((S)kC(arg), arg->n); return true; }
+    if (arg->t == -KC) { out.assign(1, arg->g); return true; }  // "b" is an atom
+    if (arg->t == -KS) { out.assign(arg->s); return true; }
+    return false;
+}
+
+K krr_text(const std::string & message) {
+    static thread_local std::string held;
+    held = message;
+    return krr((S)held.c_str());
 }

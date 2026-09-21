@@ -71,6 +71,8 @@ add_library(${MY_LIBRARY_NAME} SHARED
         src/aws_credentials.cpp
         src/aws_session.cpp
         src/module.cpp
+        src/s3_client.cpp
+        src/s3_objects.cpp
         src/utils.cpp
 )
 

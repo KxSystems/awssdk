@@ -7,6 +7,7 @@
 #include <aws/core/platform/FileSystem.h>
 
 #include "aws_session.h"
+#include "s3_client.h"
 #include "utils.h"
 
 namespace awssdk {
@@ -85,6 +86,8 @@ bool AwsSession::initialize(K options_k) {
 
 bool AwsSession::shutDown() {
   if (!initialized) return false;
+  // Clients hold SDK resources, so they have to go before ShutdownAPI.
+  destroy_all_clients();
   Aws::ShutdownAPI(options);
   initialized = false;
   return true;
