@@ -2,6 +2,14 @@
 
 Aws-sdk is written as a module, under KDB-X's module framework. Though modules can be loaded from anywhere if added to your `$QPATH`, we recommend installing under a `kx` folder within your `$QPATH`. This is to avoid name clashes with other user defined modules, as well as providing a name for other KX modules to cross reference each other.
 
+The module links against the AWS SDK for C++ shared libraries, which must be present
+at run time and not only when building. Installing from qmamba resolves them for you.
+The release archives contain only the module binary, so if you install a release you
+also need the `aws sdk cpp` libraries — see [Installing dependencies](#installing-dependencies)
+— and if they are in a non-standard location, that location must be on your
+`LD_LIBRARY_PATH`.
+
+
 ## Installing from qmamba
 
 qmamba is a package manager for kdb-x. It is currently available in a private preview capacity. You are welcome to try it and provide feedback.
@@ -21,7 +29,7 @@ It is recommended that a user install this module through a release.
 
 [Download a release](https://github.com/KxSystems/awssdk/releases) and then unzip to your module directory. The following example assumes the default install location for KDB-X.
 
-```
+```bash
 unzip aws-sdk-l64.zip -d ~/.kx/mod
 ```
 
@@ -41,12 +49,12 @@ cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_TESTING=OFF -DCMAKE_POSITION_INDEPENDE
 cmake --build . --config Release --target install 
 ```
 
-Note: your `$AWS_SDK_PATH` must be available during build time. If you use specific location, you need to add `$AWS_SDK_PATH` to 
-your `LD_LIBRARY_PATH`
+Note: `$AWS_SDK_PATH` must be on your `LD_LIBRARY_PATH` both when building this module and
+at run time whenever you load it.
 
 ### Installing Aws-sdk
 
-Afer building it move `awssdk.<platform>.[so|dll]` into your module directory, under `kx`. The following example assumes the default install location for KDB-X.
+After building it move `awssdk.<platform>.[so|dll]` into your module directory, under `kx`. The following example assumes the default install location for KDB-X.
 
 ```bash
 git clone https://github.com/KxSystems/awssdk/

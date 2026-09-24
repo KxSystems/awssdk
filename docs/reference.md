@@ -4,42 +4,97 @@ These are the API specifications for the aws-sdk module.
 
 ## initialize
 
-Initializes the sdk, needs to be called before starting to use other features.
+Initializes the SDK. Must be called before any other function in this module.
 
 **Parameters:**
 
 |Name|Type|Description|
 |---|---|---|
-|options|dict|Options to set AWS sdk|
+|options|dict or `::`|Options to set the AWS SDK, or `::` to accept every default|
+
+**Options:**
+
+|Name|Type|Default|Description|
+|---|---|---|---|
+|loglevel|string\|symbol|`"INFO"`|AWS SDK log level. One of `OFF`, `FATAL`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`, matched case-insensitively|
+|logPrefix|string|SDK default|Prefix for the SDK's own log files, e.g. `"/tmp/sdk_logs/aws_"`. Ignored when `loglevel` is `OFF`. If it contains a `/` or `\`, that directory is created if missing; failing to create it is an error|
+
+The default `logPrefix` writes files named `aws_sdk_<date>-<hour>.log` in q's current working directory.
+
+**Returns:** `1b` if this call initialized the SDK, `0b` if it was already initialized. A second call makes no changes — including to the log level — so call [`shutDown`](#shutdown) first if you need to change it.
+
+**Errors**
+
+|Error|Cause|
+|---|---|
+|`'type`|`options` is neither a dict nor `::`, or `logPrefix` is present but not a string|
+|`'loglevel`|`loglevel` is present but is not a string, or not one of the values above|
+|`'logPrefix`|`logPrefix`'s directory could not be created|
+
+The module registers an exit handler the first time it initializes, so the SDK is shut down on process exit even if [`shutDown`](#shutdown) is never called.
 
 **Example:**
 
 ```q
-sdk.initialize[::] // use default values: loglevel: info, logPrefix: your q directory
-
-params: ([loglevel: "DEBUG"; logPrefix:"/tmp/sdk_logs/aws_"])
-sdk.initialize[params] // override default params
+sdk.initialize[::] // defaults: loglevel "INFO", logPrefix in the current directory
+1b
+sdk.initialize[::] // already initialized, no change
+0b
+sdk.shutDown[::]
+1b
+sdk.initialize[([loglevel: "DEBUG"; logPrefix: "/tmp/sdk_logs/aws_"])]
+1b
+sdk.initialize[([loglevel: "asdf"])]
+'loglevel
 ```
-
 
 ## shutDown
 
-Shuts down sdk, needs to be called before exiting the session.
+Shuts down the SDK. Call it before exiting the session.
+
+**Returns:** `1b` if this call shut down an initialized SDK, `0b` if there was nothing to shut down. Any [`createClient`](#createclient) handle still held becomes inert — see [`createClient`](#createclient)'s **Returns**.
 
 **Example:**
 
 ```q
 sdk.shutDown[::]
+1b
+sdk.shutDown[::]
+0b
 ```
 
 ## getCredentials
 
-Fetches AWS credentials using the official AWS authentication chain.
+Fetches AWS credentials using the official AWS authentication chain. Requires [`initialize`](#initialize) to have been called.
+
+**Returns:** a dictionary of five keys:
+
+|Key|Type|Description|
+|---|---|---|
+|accessKey|string|AWS access key ID|
+|secretKey|string|AWS secret access key|
+|sessionToken|string|Session token. Empty for long-lived credentials|
+|accountId|string|AWS account ID. Empty if the provider does not supply one|
+|expiration|long|Expiry as milliseconds since the Unix epoch|
+
+A chain that resolves nothing is not an error: the call still succeeds and returns the same five keys with every string empty, so check the result rather than relying on a signal.
+
+Credentials are not cached, so every call resolves the chain again and returns fresh credentials. Hold on to the result rather than calling this in a tight loop.
+
+**Errors**
+
+|Error|Cause|
+|---|---|
+|`'uninitialized`|[`initialize`](#initialize) has not been called|
 
 **Example:**
 
 ```q
+sdk.initialize[::]
+1b
 credentials: sdk.getCredentials[::]
+key credentials
+`accessKey`secretKey`sessionToken`accountId`expiration
 ```
 
 ## createClient

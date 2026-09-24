@@ -1,6 +1,6 @@
-# Aws-sdk Module
+# aws-sdk Module
 
-This project is a Kdb-x module that wraps official AWS sdk. 
+This project is a KDB-X module that wraps the official AWS sdk.
 
 ## Features
 
