@@ -135,4 +135,11 @@ if[`junitPath in key params;
     h 0: r;
   ]
 
-exit $[all `pass=report`status;0;1];
+failed: select from report where status <> `pass;
+if[0<count failed;
+  -1"\n\nTest failed!\n";
+  0N!failed;
+  exit 1;
+  ];
+
+exit 0;
