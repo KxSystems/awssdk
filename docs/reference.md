@@ -305,9 +305,14 @@ Uploads a local file to S3 with a synchronous, single-request `PutObject`. Requi
 
 **Returns:** a long containing the number of bytes uploaded.
 
-The input is opened in binary mode and its size is sent as the request content length. A file that
-cannot be opened or sized is rejected before an S3 request is made. This function performs one
-`PutObject` request; use the transfer-manager API for multipart transfers when it is available.
+The input is opened in binary mode and its size is sent as the request content length. A
+`filename` that is not a regular file, such as a directory, or that cannot be opened is rejected
+before an S3 request is made.
+
+This function performs one `PutObject` request. Amazon S3 accepts at most 5 GB in a single
+`PutObject`; a larger file is rejected with `EntityTooLarge` before any of it is sent. Objects up to
+50 TB need a multipart upload, which the transfer-manager API will provide. S3-compatible servers
+set their own limits.
 
 **Example:**
 
@@ -335,6 +340,16 @@ Downloads an S3 object to a local file with a synchronous `GetObject`. Requires
 The response is streamed to a temporary file beside `filename`, so the object is not buffered in
 memory. After a complete, successful write, that file replaces the destination. An S3 or local
 write failure removes the temporary and leaves an existing destination untouched.
+
+Because the destination is replaced rather than written in place, a `filename` that is a symbolic
+link is replaced by a regular file, leaving the link's target unchanged, and an existing file's
+permissions are not kept: the new file gets the process's default permissions.
+
+There is no size limit on a download. The object is written in full to a temporary file in the
+destination's directory before it replaces `filename`, so that directory needs free space for the
+whole object, in addition to any existing file being replaced. A failed transfer is retried from
+the beginning, and nothing is kept if it ultimately fails. For large objects, the transfer-manager
+API will offer parallel downloads.
 
 **Example:**
 

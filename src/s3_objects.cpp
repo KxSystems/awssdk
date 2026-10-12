@@ -1,11 +1,12 @@
 // AWS headers first; the project headers below pull in k.h, which must come last.
 #include <cstdio>
 #include <fstream>
-#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <sys/stat.h>
 
 #include <aws/core/utils/UUID.h>
 #include <aws/core/utils/memory/AWSMemory.h>
@@ -33,18 +34,6 @@ namespace awssdk {
 namespace {
 
 const char * const list_options[] = { "prefix", "startAfter", "marker" };
-
-// putObject and getObject currently have no request-specific options. Still
-// accept an empty dictionary as well as ::, since keeping the options argument
-// makes the surface compatible with awss3kdb and leaves room for additions.
-void require_no_options(K options) {
-    if (options->t == 101) { return; }
-
-    K keys = kK(options)[0];
-    if (keys->n == 0) { return; }
-    if (keys->t != KS) { throw std::invalid_argument("type"); }
-    throw std::invalid_argument(kS(keys)[0]);
-}
 
 // An S3 API failure, reported to q with the detail the service gave. Callers
 // log this text, so it carries the exception name and message rather than one
@@ -126,7 +115,11 @@ ObjectFileArgs object_file_args(K bucket, K key, K filename, K options) {
     if (!k_to_str(bucket, args.bucket)) { throw std::invalid_argument("bucket"); }
     if (!k_to_str(key, args.key)) { throw std::invalid_argument("key"); }
     if (!k_to_str(filename, args.filename)) { throw std::invalid_argument("filename"); }
-    require_no_options(options);
+    // No request-specific options yet. The argument is kept for compatibility
+    // with awss3kdb and room for additions, so :: and an empty dictionary are
+    // accepted and any key is reported as unknown.
+    const char * unknown = dict_unknown_key(options, nullptr, 0);
+    if (unknown != nullptr) { throw std::invalid_argument(unknown); }
     return args;
 }
 
@@ -338,26 +331,32 @@ K putObject(K client, K bucket, K key, K filename, K options) {
         const ObjectFileArgs args = object_file_args(bucket, key, filename, options);
         std::shared_ptr<Aws::S3::S3Client> s3 = get_client(client);
 
-        // seekg/tellg are the input-stream operations. awss3kdb used the put
-        // pointer here, which happens to work with some fstream implementations
-        // but is the wrong sequence for a file opened only for input.
+        // Only a regular file has a meaningful size. On Linux an fstream opens a
+        // directory without error and reports its length as INT64_MAX, which
+        // would otherwise be sent as the content length. S_IFMT is used rather
+        // than S_ISREG because MSVC does not define the latter, and MSVC needs
+        // _stat64 because its struct stat holds a 32-bit size.
+#ifdef _WIN32
+        struct _stat64 info;
+        const int found = _stat64(args.filename.c_str(), &info);
+#else
+        struct stat info;
+        const int found = stat(args.filename.c_str(), &info);
+#endif
+        if (found != 0 || (info.st_mode & S_IFMT) != S_IFREG) {
+            throw file_error("read", args.filename);
+        }
+        const long long length = static_cast<long long>(info.st_size);
+
         std::shared_ptr<Aws::FStream> body = Aws::MakeShared<Aws::FStream>(
             "awssdk-put-object", args.filename.c_str(),
             std::ios_base::in | std::ios_base::binary);
         if (!body->is_open()) { throw file_error("read", args.filename); }
 
-        body->seekg(0, std::ios_base::end);
-        const std::streamoff length = body->tellg();
-        if (length < 0 || length > std::numeric_limits<J>::max()) {
-            throw file_error("read", args.filename);
-        }
-        body->seekg(0, std::ios_base::beg);
-        if (!body->good()) { throw file_error("read", args.filename); }
-
         Aws::S3::Model::PutObjectRequest request;
         request.SetBucket(args.bucket.c_str());
         request.SetKey(args.key.c_str());
-        request.SetContentLength(static_cast<long long>(length));
+        request.SetContentLength(length);
         request.SetBody(body);
 
         const auto outcome = s3->PutObject(request);
@@ -413,8 +412,7 @@ K getObject(K client, K bucket, K key, K filename, K options) {
         }
         output->flush();
         const std::streamoff length = output->tellp();
-        const bool wrote = output->good() && length >= 0
-            && length <= std::numeric_limits<J>::max();
+        const bool wrote = output->good() && length >= 0;
         output->close();
         if (!wrote || output->fail()) { throw file_error("write", args.filename); }
 

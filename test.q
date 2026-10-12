@@ -103,8 +103,7 @@ t.assertError[{aws.listObjectsMetadata[lo;"bucket";1 2 3]};"type";::]
 t.assertError[{aws.listObjectsMetadata[lo;"bucket";([depth:1])]};"depth";::]
 
 t.feature `objectTransfer
-// Argument validation and local upload failure need no S3 endpoint. Live
-// round-trip coverage uses MinIO separately.
+// Argument validation and local upload failure need no S3 endpoint.
 t.before[{ot::aws.createClient[::]}]
 t.assertError[{aws.putObject[42;"bucket";"key";"file";::]};"client";::]
 t.assertError[{aws.getObject[42;"bucket";"key";"file";::]};"client";::]
@@ -123,6 +122,9 @@ t.assertError[{aws.getObject[ot;"bucket";"key";"file";([versionId:"1"])]};"versi
 // An empty options dictionary is equivalent to ::. The missing input is
 // rejected before an HTTP request is attempted.
 t.assertError[{aws.putObject[ot;"bucket";"key";"/no/such/awssdk-input";()!()]};"unable to read file: /no/such/awssdk-input";::]
+// A directory opens as a stream on Linux and claims a size of INT64_MAX, so it
+// has to be rejected as not a regular file rather than sent.
+t.assertError[{aws.putObject[ot;"bucket";"key";"/tmp";::]};"unable to read file: /tmp";::]
 // The destination directory is probed before the request, so a local path
 // failure also avoids an unnecessary network call.
 t.assertError[{aws.getObject[ot;"bucket";"key";"/no/such/awssdk-dir/output";::]};"unable to write file: /no/such/awssdk-dir/output";::]
