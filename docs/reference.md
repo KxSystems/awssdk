@@ -287,3 +287,57 @@ exec sum size from listing
 // anything not on standard storage
 select from 0!listing where not storageClass = `STANDARD
 ```
+
+## putObject
+
+Uploads a local file to S3 with a synchronous, single-request `PutObject`. Requires
+[`initialize`](#initialize) and a client from [`createClient`](#createclient).
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|client|foreign|A client from [`createClient`](#createclient)|
+|bucket|string\|symbol|Destination bucket|
+|key|string\|symbol|Destination object key|
+|filename|string\|symbol|Local file to upload|
+|options|dict|Reserved for future options; pass `::` or an empty dictionary|
+
+**Returns:** a long containing the number of bytes uploaded.
+
+The input is opened in binary mode and its size is sent as the request content length. A file that
+cannot be opened or sized is rejected before an S3 request is made. This function performs one
+`PutObject` request; use the transfer-manager API for multipart transfers when it is available.
+
+**Example:**
+
+```q
+bytes: sdk.putObject[client; "my-bucket"; "data/input.csv"; "input.csv"; ::]
+```
+
+## getObject
+
+Downloads an S3 object to a local file with a synchronous `GetObject`. Requires
+[`initialize`](#initialize) and a client from [`createClient`](#createclient).
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|client|foreign|A client from [`createClient`](#createclient)|
+|bucket|string\|symbol|Source bucket|
+|key|string\|symbol|Source object key|
+|filename|string\|symbol|Local destination file|
+|options|dict|Reserved for future options; pass `::` or an empty dictionary|
+
+**Returns:** a long containing the number of bytes written.
+
+The response is streamed to a temporary file beside `filename`, so the object is not buffered in
+memory. After a complete, successful write, that file replaces the destination. An S3 or local
+write failure removes the temporary and leaves an existing destination untouched.
+
+**Example:**
+
+```q
+bytes: sdk.getObject[client; "my-bucket"; "data/input.csv"; "download.csv"; ::]
+```
