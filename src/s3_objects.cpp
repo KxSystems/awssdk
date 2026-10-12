@@ -1,13 +1,26 @@
 // AWS headers first; the project headers below pull in k.h, which must come last.
+#include <cstdio>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <aws/core/utils/UUID.h>
+#include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/s3/S3Client.h>
+#include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/Object.h>
 #include <aws/s3/model/ObjectStorageClass.h>
+#include <aws/s3/model/PutObjectRequest.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include "aws_session.h"
 #include "s3_client_handle.h"
@@ -21,12 +34,100 @@ namespace {
 
 const char * const list_options[] = { "prefix", "startAfter", "marker" };
 
+// putObject and getObject currently have no request-specific options. Still
+// accept an empty dictionary as well as ::, since keeping the options argument
+// makes the surface compatible with awss3kdb and leaves room for additions.
+void require_no_options(K options) {
+    if (options->t == 101) { return; }
+
+    K keys = kK(options)[0];
+    if (keys->n == 0) { return; }
+    if (keys->t != KS) { throw std::invalid_argument("type"); }
+    throw std::invalid_argument(kS(keys)[0]);
+}
+
 // An S3 API failure, reported to q with the detail the service gave. Callers
 // log this text, so it carries the exception name and message rather than one
 // of the short tokens used for bad arguments.
 std::string s3_error(const Aws::S3::S3Error & error) {
     return std::string(error.GetExceptionName().c_str()) + ": "
         + error.GetMessage().c_str();
+}
+
+std::runtime_error file_error(const char * operation,
+        const std::string & filename) {
+    return std::runtime_error(std::string("unable to ") + operation
+        + " file: " + filename);
+}
+
+// A GetObject response is streamed to a sibling temporary file. This avoids
+// holding a large object in the SDK's default response stream and, unlike
+// writing the destination directly, leaves an existing destination untouched
+// when S3 or the local write fails. The successful rename is atomic on the
+// platforms supported by the module when source and destination share a
+// directory.
+class DownloadTarget {
+public:
+    explicit DownloadTarget(const std::string & destination)
+        : destination_(destination), committed_(false) {
+        const Aws::String uuid = Aws::Utils::UUID::RandomUUID();
+        temporary_ = destination_ + ".awssdk-" + uuid.c_str() + ".part";
+
+        // Fail before making the S3 request if the destination directory is
+        // not writable. The response factory opens this path again because a
+        // retry needs a fresh stream positioned at byte zero.
+        Aws::FStream probe(temporary_.c_str(),
+            std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
+        if (!probe.is_open()) { throw file_error("write", destination_); }
+        probe.close();
+        if (probe.fail()) {
+            // A throwing constructor has no destructor call, so clean this
+            // path explicitly rather than relying on ~DownloadTarget.
+            std::remove(temporary_.c_str());
+            throw file_error("write", destination_);
+        }
+    }
+
+    ~DownloadTarget() {
+        if (!committed_) { std::remove(temporary_.c_str()); }
+    }
+
+    const std::string & temporary() const { return temporary_; }
+
+    void commit() {
+#ifdef _WIN32
+        const bool moved = 0 != MoveFileExA(temporary_.c_str(),
+            destination_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+        // POSIX rename atomically replaces an existing destination because
+        // the temporary lives in the same directory.
+        const bool moved = 0 == std::rename(temporary_.c_str(), destination_.c_str());
+#endif
+        if (!moved) {
+            throw file_error("write", destination_);
+        }
+        committed_ = true;
+    }
+
+private:
+    std::string destination_;
+    std::string temporary_;
+    bool committed_;
+};
+
+struct ObjectFileArgs {
+    std::string bucket;
+    std::string key;
+    std::string filename;
+};
+
+ObjectFileArgs object_file_args(K bucket, K key, K filename, K options) {
+    ObjectFileArgs args;
+    if (!k_to_str(bucket, args.bucket)) { throw std::invalid_argument("bucket"); }
+    if (!k_to_str(key, args.key)) { throw std::invalid_argument("key"); }
+    if (!k_to_str(filename, args.filename)) { throw std::invalid_argument("filename"); }
+    require_no_options(options);
+    return args;
 }
 
 // q timestamps count nanoseconds from 2000.01.01, so an epoch-millisecond
@@ -220,6 +321,105 @@ K listObjectsMetadata(K client, K bucket, K options) {
         K values = knk(5, sizes, modified, etags, classes, owner_ids);
 
         return xD(key_table(objects), xT(xD(columns, values)));
+    } catch (const std::exception & exc) {
+        return krr_text(exc.what());
+    }
+}
+
+K putObject(K client, K bucket, K key, K filename, K options) {
+    if (!AwsSession::getInstance().isInitialized()) {
+        return krr("uninitialized");
+    }
+    if (options == nullptr || (options->t != XD && options->t != 101)) {
+        return krr("type");
+    }
+
+    try {
+        const ObjectFileArgs args = object_file_args(bucket, key, filename, options);
+        std::shared_ptr<Aws::S3::S3Client> s3 = get_client(client);
+
+        // seekg/tellg are the input-stream operations. awss3kdb used the put
+        // pointer here, which happens to work with some fstream implementations
+        // but is the wrong sequence for a file opened only for input.
+        std::shared_ptr<Aws::FStream> body = Aws::MakeShared<Aws::FStream>(
+            "awssdk-put-object", args.filename.c_str(),
+            std::ios_base::in | std::ios_base::binary);
+        if (!body->is_open()) { throw file_error("read", args.filename); }
+
+        body->seekg(0, std::ios_base::end);
+        const std::streamoff length = body->tellg();
+        if (length < 0 || length > std::numeric_limits<J>::max()) {
+            throw file_error("read", args.filename);
+        }
+        body->seekg(0, std::ios_base::beg);
+        if (!body->good()) { throw file_error("read", args.filename); }
+
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(args.bucket.c_str());
+        request.SetKey(args.key.c_str());
+        request.SetContentLength(static_cast<long long>(length));
+        request.SetBody(body);
+
+        const auto outcome = s3->PutObject(request);
+        if (!outcome.IsSuccess()) {
+            throw std::runtime_error(s3_error(outcome.GetError()));
+        }
+        return kj(static_cast<J>(length));
+    } catch (const std::exception & exc) {
+        return krr_text(exc.what());
+    }
+}
+
+K getObject(K client, K bucket, K key, K filename, K options) {
+    if (!AwsSession::getInstance().isInitialized()) {
+        return krr("uninitialized");
+    }
+    if (options == nullptr || (options->t != XD && options->t != 101)) {
+        return krr("type");
+    }
+
+    try {
+        const ObjectFileArgs args = object_file_args(bucket, key, filename, options);
+        std::shared_ptr<Aws::S3::S3Client> s3 = get_client(client);
+        DownloadTarget target(args.filename);
+
+        Aws::S3::Model::GetObjectRequest request;
+        request.SetBucket(args.bucket.c_str());
+        request.SetKey(args.key.c_str());
+
+        // The SDK owns the returned stream. It may ask for another one when a
+        // request is retried, so the factory always reopens and truncates the
+        // temporary file rather than capturing a single stream instance.
+        const std::string temporary = target.temporary();
+        request.SetResponseStreamFactory([temporary]() -> Aws::IOStream * {
+            return Aws::New<Aws::FStream>("awssdk-get-object",
+                temporary.c_str(), std::ios_base::in | std::ios_base::out
+                    | std::ios_base::binary | std::ios_base::trunc);
+        });
+
+        auto outcome = s3->GetObject(request);
+        if (!outcome.IsSuccess()) {
+            throw std::runtime_error(s3_error(outcome.GetError()));
+        }
+
+        // This is the FStream supplied above. Flush and close it explicitly so
+        // local I/O errors are reported before the temporary replaces the
+        // destination, and so the rename also works on platforms that cannot
+        // rename an open file.
+        Aws::IOStream & response = outcome.GetResult().GetBody();
+        Aws::FStream * output = dynamic_cast<Aws::FStream *>(&response);
+        if (output == nullptr || !output->is_open()) {
+            throw file_error("write", args.filename);
+        }
+        output->flush();
+        const std::streamoff length = output->tellp();
+        const bool wrote = output->good() && length >= 0
+            && length <= std::numeric_limits<J>::max();
+        output->close();
+        if (!wrote || output->fail()) { throw file_error("write", args.filename); }
+
+        target.commit();
+        return kj(static_cast<J>(length));
     } catch (const std::exception & exc) {
         return krr_text(exc.what());
     }

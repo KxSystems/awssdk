@@ -11,4 +11,6 @@
 namespace awssdk {
     K listObjects(K client, K bucket, K options);
     K listObjectsMetadata(K client, K bucket, K options);
+    K putObject(K client, K bucket, K key, K filename, K options);
+    K getObject(K client, K bucket, K key, K filename, K options);
 }

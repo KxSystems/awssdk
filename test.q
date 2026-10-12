@@ -13,6 +13,8 @@ t.assertError[{aws.getCredentials[::]};"uninitialized";::]
 t.assertError[{aws.createClient[::]};"uninitialized";::]
 t.assertError[{aws.listObjects[::;"bucket";::]};"uninitialized";::]
 t.assertError[{aws.listObjectsMetadata[::;"bucket";::]};"uninitialized";::]
+t.assertError[{aws.putObject[::;"bucket";"key";"file";::]};"uninitialized";::]
+t.assertError[{aws.getObject[::;"bucket";"key";"file";::]};"uninitialized";::]
 t.assertFalse[{aws.shutDown[::]};::]
 
 t.feature `initialize
@@ -99,6 +101,31 @@ t.assertError[{aws.listObjectsMetadata[42;"bucket";::]};"client";::]
 t.assertError[{aws.listObjectsMetadata[lo;42;::]};"bucket";::]
 t.assertError[{aws.listObjectsMetadata[lo;"bucket";1 2 3]};"type";::]
 t.assertError[{aws.listObjectsMetadata[lo;"bucket";([depth:1])]};"depth";::]
+
+t.feature `objectTransfer
+// Argument validation and local upload failure need no S3 endpoint. Live
+// round-trip coverage uses MinIO separately.
+t.before[{ot::aws.createClient[::]}]
+t.assertError[{aws.putObject[42;"bucket";"key";"file";::]};"client";::]
+t.assertError[{aws.getObject[42;"bucket";"key";"file";::]};"client";::]
+// `client` was swept by the earlier shutDown and must never resolve to a new
+// client, even though its foreign remains live.
+t.assertError[{aws.putObject[client;"bucket";"key";"file";::]};"client";::]
+t.assertError[{aws.getObject[client;"bucket";"key";"file";::]};"client";::]
+t.assertError[{aws.putObject[ot;42;"key";"file";::]};"bucket";::]
+t.assertError[{aws.putObject[ot;"bucket";42;"file";::]};"key";::]
+t.assertError[{aws.putObject[ot;"bucket";"key";42;::]};"filename";::]
+t.assertError[{aws.getObject[ot;"bucket";42;"file";::]};"key";::]
+t.assertError[{aws.getObject[ot;"bucket";"key";42;::]};"filename";::]
+t.assertError[{aws.putObject[ot;"bucket";"key";"file";1 2 3]};"type";::]
+t.assertError[{aws.putObject[ot;"bucket";"key";"file";([contentType:"text/plain"])]};"contentType";::]
+t.assertError[{aws.getObject[ot;"bucket";"key";"file";([versionId:"1"])]};"versionId";::]
+// An empty options dictionary is equivalent to ::. The missing input is
+// rejected before an HTTP request is attempted.
+t.assertError[{aws.putObject[ot;"bucket";"key";"/no/such/awssdk-input";()!()]};"unable to read file: /no/such/awssdk-input";::]
+// The destination directory is probed before the request, so a local path
+// failure also avoids an unnecessary network call.
+t.assertError[{aws.getObject[ot;"bucket";"key";"/no/such/awssdk-dir/output";::]};"unable to write file: /no/such/awssdk-dir/output";::]
 
 t.feature `handleReuse
 // `client` from the createClient feature is a stale handle: the sweep emptied
