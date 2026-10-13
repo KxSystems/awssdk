@@ -1,0 +1,24 @@
+name: q-kx-awssdk
+description: >-
+  kdb-x APIs to authenticate using the AWS C++ SDK. 
+homepage: https://github.com/KxSystems/awssdk
+namespace: kx.awssdk
+
+source:
+  repo: https://github.com/KxSystems/awssdk
+  ref: 0.0.3
+  path: .
+
+license: Apache-2.0
+
+maintainers:
+  - github: KxSystems
+
+platforms:
+  - linux
+  - linux-arm
+  - mac
+  - mac-arm
+
+compatibility:
+  kdbx: ">=5.0.0"
