@@ -6,7 +6,7 @@ namespace: kx.awssdk
 
 source:
   repo: https://github.com/KxSystems/awssdk
-  ref: 0.0.3
+  version: 0.0.3
   path: .
 
 license: Apache-2.0
