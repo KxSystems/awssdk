@@ -52,9 +52,13 @@ sdk.initialize[([loglevel: "asdf"])]
 
 Shuts down the SDK. Call it before exiting the session.
 
-**Returns:** `1b` if this call shut down an initialized SDK, `0b` if there was nothing to shut down. Any [`createClient`](#createclient) or [`createTransferManager`](#createtransfermanager) handle still held becomes inert — see [`createClient`](#createclient)'s **Returns**.
+**Returns:** `1b` if this call shut down an initialized SDK, `0b` if there was nothing to shut down. Signals `'busy` if SDK threads were still busy, as described below. Any [`createClient`](#createclient) or [`createTransferManager`](#createtransfermanager) handle still held becomes inert — see [`createClient`](#createclient)'s **Returns**.
 
-`shutDown` must not run while another call into this module is in progress. Every function here currently runs on q's main thread and returns only once its work is finished, so that holds for any q code; it matters only if the module is called from other threads.
+`shutDown` must not run while another call into this module is in progress. Every function here runs on q's main thread, so that holds for any q code; it matters only if the module is called from other threads.
+
+Transfers started by [`uploadAsync`](#uploadasync) or [`downloadAsync`](#downloadasync) and still running are canceled, and `shutDown` waits for them to stop before returning. Each one's callback still receives a final report, normally `` `CANCELED ``, once q's event loop next runs: a download through a temporary file leaves no file behind, and a multipart upload is aborted.
+
+The SDK's own threads can still be finishing work for a few moments after a transfer ends. `shutDown` waits up to 10 seconds for them before shutting the SDK down. If they are still busy after that, it signals `'busy` and leaves the SDK initialized, since shutting it down under them is unsafe; every handle is already invalidated, and calling `shutDown` again completes it once they are done.
 
 **Example:**
 
@@ -473,6 +477,8 @@ across its threads. As with [`getObject`](#getobject), it is written by default 
 beside `filename`, which replaces the destination after a complete, successful download, so a
 failure leaves an existing destination untouched. The same notes apply: the directory needs free
 space for the whole object, and a symbolic link or an existing file's permissions are not kept.
+After a failure, the temporary is removed once the SDK has closed it: normally before `download`
+returns, otherwise moments after.
 
 With `inPlace`, the ranges are written straight into `filename`, as `awss3kdb` did, for callers
 that track a download by its final path. The size request comes first, so a missing object or a
@@ -486,4 +492,105 @@ gaps that read as zeros: in place, the file's size does not show whether the dow
 ```q
 bytes: sdk.download[tm; "my-bucket"; "data/input.parquet"; "input.parquet"; ::]
 bytes: sdk.download[tm; "my-bucket"; "data/input.parquet"; "input.parquet"; ([inPlace: 1b])]
+```
+
+## uploadAsync
+
+Starts uploading a local file to S3 through a transfer manager, and returns at once. Progress and
+the outcome are reported to a callback. Requires [`initialize`](#initialize) and a transfer manager
+from [`createTransferManager`](#createtransfermanager).
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|transferManager|foreign|A transfer manager from [`createTransferManager`](#createtransfermanager)|
+|bucket|string\|symbol|Destination bucket|
+|key|string\|symbol|Destination object key|
+|filename|string\|symbol|Local file to upload|
+|options|dict|Options; `callback` is required|
+
+**Options:**
+
+|Name|Type|Default|Description|
+|---|---|---|---|
+|callback|function|required|Called with a report dictionary, described below|
+
+**Returns:** `::`.
+
+The upload itself behaves as [`upload`](#upload) does: one `PutObject` up to 5 MB, a parallel
+multipart upload above that, at most 10,000 parts, and a failed multipart upload is aborted. The
+file must not change until the upload has finished. Anything wrong with the arguments, or a
+`filename` that is not a regular file or is too large, is an error from this call; anything that
+goes wrong once the upload has started is reported to the callback.
+
+### Reports
+
+The callback is called on q's main thread, whenever q's event loop is idle, with a dictionary:
+
+|Key|Type|Description|
+|---|---|---|
+|bucket|string|The bucket given|
+|key|string|The key given|
+|filename|string|The file given|
+|direction|symbol|`` `UPLOAD `` or `` `DOWNLOAD ``|
+|status|symbol|`` `NOT_STARTED ``, `` `IN_PROGRESS ``, or a final status: `` `COMPLETED ``, `` `FAILED ``, `` `CANCELED `` or `` `ABORTED ``|
+|transferred|long|Bytes transferred so far|
+|total|long|Size of the object, once known|
+|error|string|Why the transfer failed; empty otherwise|
+
+A transfer is reported each time it changes status and, while downloading, after each 5 MB part,
+then exactly once with a final status, after which nothing more is reported for it. The keys and
+values match those `awss3kdb` reported, so callbacks written for it work unchanged.
+
+An error signalled by the callback is printed to standard error and has no other effect: the
+transfer and other transfers' reports carry on. Reports are delivered only while q's event loop
+runs, so a script that waits in a loop of its own, or exits, receives none.
+
+The transfer keeps its transfer manager alive until its final report, so the transfer manager's
+handle can be dropped while it runs.
+
+**Example:**
+
+```q
+done: {[d] if[d[`status] in `COMPLETED`FAILED; -1 d[`key], ": ", string d`status]}
+sdk.uploadAsync[tm; "my-bucket"; "data/input.parquet"; "input.parquet"; ([callback: done])]
+```
+
+## downloadAsync
+
+Starts downloading an S3 object to a local file through a transfer manager, and returns at once.
+Progress and the outcome are reported to a callback. Requires [`initialize`](#initialize) and a
+transfer manager from [`createTransferManager`](#createtransfermanager).
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|transferManager|foreign|A transfer manager from [`createTransferManager`](#createtransfermanager)|
+|bucket|string\|symbol|Source bucket|
+|key|string\|symbol|Source object key|
+|filename|string\|symbol|Local destination file|
+|options|dict|Options; `callback` is required|
+
+**Options:**
+
+|Name|Type|Default|Description|
+|---|---|---|---|
+|callback|function|required|Called with a report dictionary, as for [`uploadAsync`](#reports)|
+|inPlace|boolean\|long|`0b`|Write straight into `filename` instead of through a temporary file|
+
+**Returns:** `::`.
+
+The download itself behaves as [`download`](#download) does, including what `inPlace` changes. By
+default the temporary file has already replaced `filename` when the callback receives
+`` `COMPLETED ``, so the callback can read the file. After any other final status the temporary is
+removed once the SDK has closed it: normally before the callback runs, otherwise moments after. An unwritable destination directory is an error from this call; anything that goes wrong
+once the download has started is reported to the callback.
+
+**Example:**
+
+```q
+done: {[d] if[d[`status] in `COMPLETED`FAILED; -1 d[`filename], ": ", string d`status]}
+sdk.downloadAsync[tm; "my-bucket"; "data/input.parquet"; "input.parquet"; ([callback: done])]
 ```
