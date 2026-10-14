@@ -8,6 +8,7 @@
 
 #include "aws_session.h"
 #include "s3_client.h"
+#include "s3_transfer.h"
 #include "utils.h"
 
 namespace awssdk {
@@ -84,9 +85,18 @@ bool AwsSession::initialize(K options_k) {
   return true;
 }
 
+// Must not run while any other call into the module is in progress: a call
+// in flight keeps its client or transfer manager alive past the sweep below,
+// and would then be using the SDK after ShutdownAPI. Today every entry point
+// runs on q's main thread and finishes its SDK work before returning, so they
+// cannot overlap. Enabling setm(1) for the async callbacks ends that, and is
+// when the session needs a shared/exclusive guard held across each operation.
 bool AwsSession::shutDown() {
   if (!initialized) return false;
-  // Clients hold SDK resources, so they have to go before ShutdownAPI.
+  // Handles hold SDK resources, so they have to go before ShutdownAPI.
+  // Transfer managers first: each one holds a client, which would otherwise
+  // outlive the client sweep and be destroyed after ShutdownAPI.
+  destroy_all_transfer_managers();
   destroy_all_clients();
   Aws::ShutdownAPI(options);
   initialized = false;

@@ -1,14 +1,10 @@
 // AWS headers first; the project headers below pull in k.h, which must come last.
-#include <cstdio>
 #include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#include <sys/stat.h>
-
-#include <aws/core/utils/UUID.h>
 #include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/s3/S3Client.h>
 #include <aws/s3/model/GetObjectRequest.h>
@@ -17,14 +13,9 @@
 #include <aws/s3/model/ObjectStorageClass.h>
 #include <aws/s3/model/PutObjectRequest.h>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
-#endif
-
 #include "aws_session.h"
 #include "s3_client_handle.h"
+#include "s3_files.h"
 #include "s3_objects.h"
 #include "utils.h"
 
@@ -34,94 +25,6 @@ namespace awssdk {
 namespace {
 
 const char * const list_options[] = { "prefix", "startAfter", "marker" };
-
-// An S3 API failure, reported to q with the detail the service gave. Callers
-// log this text, so it carries the exception name and message rather than one
-// of the short tokens used for bad arguments.
-std::string s3_error(const Aws::S3::S3Error & error) {
-    return std::string(error.GetExceptionName().c_str()) + ": "
-        + error.GetMessage().c_str();
-}
-
-std::runtime_error file_error(const char * operation,
-        const std::string & filename) {
-    return std::runtime_error(std::string("unable to ") + operation
-        + " file: " + filename);
-}
-
-// A GetObject response is streamed to a sibling temporary file. This avoids
-// holding a large object in the SDK's default response stream and, unlike
-// writing the destination directly, leaves an existing destination untouched
-// when S3 or the local write fails. The successful rename is atomic on the
-// platforms supported by the module when source and destination share a
-// directory.
-class DownloadTarget {
-public:
-    explicit DownloadTarget(const std::string & destination)
-        : destination_(destination), committed_(false) {
-        const Aws::String uuid = Aws::Utils::UUID::RandomUUID();
-        temporary_ = destination_ + ".awssdk-" + uuid.c_str() + ".part";
-
-        // Fail before making the S3 request if the destination directory is
-        // not writable. The response factory opens this path again because a
-        // retry needs a fresh stream positioned at byte zero.
-        Aws::FStream probe(temporary_.c_str(),
-            std::ios_base::out | std::ios_base::binary | std::ios_base::trunc);
-        if (!probe.is_open()) { throw file_error("write", destination_); }
-        probe.close();
-        if (probe.fail()) {
-            // A throwing constructor has no destructor call, so clean this
-            // path explicitly rather than relying on ~DownloadTarget.
-            std::remove(temporary_.c_str());
-            throw file_error("write", destination_);
-        }
-    }
-
-    ~DownloadTarget() {
-        if (!committed_) { std::remove(temporary_.c_str()); }
-    }
-
-    const std::string & temporary() const { return temporary_; }
-
-    void commit() {
-#ifdef _WIN32
-        const bool moved = 0 != MoveFileExA(temporary_.c_str(),
-            destination_.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-#else
-        // POSIX rename atomically replaces an existing destination because
-        // the temporary lives in the same directory.
-        const bool moved = 0 == std::rename(temporary_.c_str(), destination_.c_str());
-#endif
-        if (!moved) {
-            throw file_error("write", destination_);
-        }
-        committed_ = true;
-    }
-
-private:
-    std::string destination_;
-    std::string temporary_;
-    bool committed_;
-};
-
-struct ObjectFileArgs {
-    std::string bucket;
-    std::string key;
-    std::string filename;
-};
-
-ObjectFileArgs object_file_args(K bucket, K key, K filename, K options) {
-    ObjectFileArgs args;
-    if (!k_to_str(bucket, args.bucket)) { throw std::invalid_argument("bucket"); }
-    if (!k_to_str(key, args.key)) { throw std::invalid_argument("key"); }
-    if (!k_to_str(filename, args.filename)) { throw std::invalid_argument("filename"); }
-    // No request-specific options yet. The argument is kept for compatibility
-    // with awss3kdb and room for additions, so :: and an empty dictionary are
-    // accepted and any key is reported as unknown.
-    const char * unknown = dict_unknown_key(options, nullptr, 0);
-    if (unknown != nullptr) { throw std::invalid_argument(unknown); }
-    return args;
-}
 
 // q timestamps count nanoseconds from 2000.01.01, so an epoch-millisecond
 // value has to be rebased as well as scaled. A DateTime the service left unset
@@ -328,25 +231,10 @@ K putObject(K client, K bucket, K key, K filename, K options) {
     }
 
     try {
-        const ObjectFileArgs args = object_file_args(bucket, key, filename, options);
+        const ObjectFileArgs args = object_file_args(bucket, key, filename);
+        require_no_options(options);
         std::shared_ptr<Aws::S3::S3Client> s3 = get_client(client);
-
-        // Only a regular file has a meaningful size. On Linux an fstream opens a
-        // directory without error and reports its length as INT64_MAX, which
-        // would otherwise be sent as the content length. S_IFMT is used rather
-        // than S_ISREG because MSVC does not define the latter, and MSVC needs
-        // _stat64 because its struct stat holds a 32-bit size.
-#ifdef _WIN32
-        struct _stat64 info;
-        const int found = _stat64(args.filename.c_str(), &info);
-#else
-        struct stat info;
-        const int found = stat(args.filename.c_str(), &info);
-#endif
-        if (found != 0 || (info.st_mode & S_IFMT) != S_IFREG) {
-            throw file_error("read", args.filename);
-        }
-        const long long length = static_cast<long long>(info.st_size);
+        const long long length = regular_file_size(args.filename);
 
         std::shared_ptr<Aws::FStream> body = Aws::MakeShared<Aws::FStream>(
             "awssdk-put-object", args.filename.c_str(),
@@ -378,9 +266,10 @@ K getObject(K client, K bucket, K key, K filename, K options) {
     }
 
     try {
-        const ObjectFileArgs args = object_file_args(bucket, key, filename, options);
+        const ObjectFileArgs args = object_file_args(bucket, key, filename);
+        const bool in_place = in_place_option(options);
         std::shared_ptr<Aws::S3::S3Client> s3 = get_client(client);
-        DownloadTarget target(args.filename);
+        DownloadTarget target(args.filename, in_place);
 
         Aws::S3::Model::GetObjectRequest request;
         request.SetBucket(args.bucket.c_str());
@@ -388,21 +277,30 @@ K getObject(K client, K bucket, K key, K filename, K options) {
 
         // The SDK owns the returned stream. It may ask for another one when a
         // request is retried, so the factory always reopens and truncates the
-        // temporary file rather than capturing a single stream instance.
-        const std::string temporary = target.temporary();
-        request.SetResponseStreamFactory([temporary]() -> Aws::IOStream * {
+        // file rather than capturing a single stream instance. `target` is
+        // declared before `outcome`, so it is destroyed after the stream.
+        //
+        // The SDK opens the stream before it knows the status, so in place a
+        // failure has already truncated the destination, and may have left
+        // S3's XML error body in it: marked written, it is removed. A failure
+        // before any response leaves it untouched.
+        const std::string path = target.path();
+        std::shared_ptr<bool> opened = std::make_shared<bool>(false);
+        request.SetResponseStreamFactory([path, opened]() -> Aws::IOStream * {
+            *opened = true;
             return Aws::New<Aws::FStream>("awssdk-get-object",
-                temporary.c_str(), std::ios_base::in | std::ios_base::out
+                path.c_str(), std::ios_base::in | std::ios_base::out
                     | std::ios_base::binary | std::ios_base::trunc);
         });
 
         auto outcome = s3->GetObject(request);
         if (!outcome.IsSuccess()) {
+            if (*opened) { target.mark_written(); }
             throw std::runtime_error(s3_error(outcome.GetError()));
         }
 
         // This is the FStream supplied above. Flush and close it explicitly so
-        // local I/O errors are reported before the temporary replaces the
+        // local I/O errors are reported before a temporary replaces the
         // destination, and so the rename also works on platforms that cannot
         // rename an open file.
         Aws::IOStream & response = outcome.GetResult().GetBody();
@@ -414,7 +312,10 @@ K getObject(K client, K bucket, K key, K filename, K options) {
         const std::streamoff length = output->tellp();
         const bool wrote = output->good() && length >= 0;
         output->close();
-        if (!wrote || output->fail()) { throw file_error("write", args.filename); }
+        if (!wrote || output->fail()) {
+            target.mark_written();
+            throw file_error("write", args.filename);
+        }
 
         target.commit();
         return kj(static_cast<J>(length));

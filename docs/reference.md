@@ -52,7 +52,9 @@ sdk.initialize[([loglevel: "asdf"])]
 
 Shuts down the SDK. Call it before exiting the session.
 
-**Returns:** `1b` if this call shut down an initialized SDK, `0b` if there was nothing to shut down. Any [`createClient`](#createclient) handle still held becomes inert — see [`createClient`](#createclient)'s **Returns**.
+**Returns:** `1b` if this call shut down an initialized SDK, `0b` if there was nothing to shut down. Any [`createClient`](#createclient) or [`createTransferManager`](#createtransfermanager) handle still held becomes inert — see [`createClient`](#createclient)'s **Returns**.
+
+`shutDown` must not run while another call into this module is in progress. Every function here currently runs on q's main thread and returns only once its work is finished, so that holds for any q code; it matters only if the module is called from other threads.
 
 **Example:**
 
@@ -307,12 +309,11 @@ Uploads a local file to S3 with a synchronous, single-request `PutObject`. Requi
 
 The input is opened in binary mode and its size is sent as the request content length. A
 `filename` that is not a regular file, such as a directory, or that cannot be opened is rejected
-before an S3 request is made.
+before an S3 request is made. The file must not change while it is being uploaded.
 
 This function performs one `PutObject` request. Amazon S3 accepts at most 5 GB in a single
-`PutObject`; a larger file is rejected with `EntityTooLarge` before any of it is sent. Objects up to
-50 TB need a multipart upload, which the transfer-manager API will provide. S3-compatible servers
-set their own limits.
+`PutObject`; a larger file is rejected with `EntityTooLarge` before any of it is sent. Larger files
+need a multipart upload: see [`upload`](#upload). S3-compatible servers set their own limits.
 
 **Example:**
 
@@ -333,13 +334,20 @@ Downloads an S3 object to a local file with a synchronous `GetObject`. Requires
 |bucket|string\|symbol|Source bucket|
 |key|string\|symbol|Source object key|
 |filename|string\|symbol|Local destination file|
-|options|dict|Reserved for future options; pass `::` or an empty dictionary|
+|options|dict|Options, or `::` for the defaults|
+
+**Options:**
+
+|Name|Type|Default|Description|
+|---|---|---|---|
+|inPlace|boolean\|long|`0b`|Write straight into `filename` instead of through a temporary file. See below|
 
 **Returns:** a long containing the number of bytes written.
 
-The response is streamed to a temporary file beside `filename`, so the object is not buffered in
-memory. After a complete, successful write, that file replaces the destination. An S3 or local
-write failure removes the temporary and leaves an existing destination untouched.
+The response is streamed to disk, so the object is not buffered in memory. By default it goes to a
+temporary file beside `filename`, which replaces the destination after a complete, successful
+write. An S3 or local write failure removes the temporary and leaves an existing destination
+untouched.
 
 Because the destination is replaced rather than written in place, a `filename` that is a symbolic
 link is replaced by a regular file, leaving the link's target unchanged, and an existing file's
@@ -348,11 +356,134 @@ permissions are not kept: the new file gets the process's default permissions.
 There is no size limit on a download. The object is written in full to a temporary file in the
 destination's directory before it replaces `filename`, so that directory needs free space for the
 whole object, in addition to any existing file being replaced. A failed transfer is retried from
-the beginning, and nothing is kept if it ultimately fails. For large objects, the transfer-manager
-API will offer parallel downloads.
+the beginning, and nothing is kept if it ultimately fails. For large objects,
+[`download`](#download) fetches parts in parallel.
+
+With `inPlace`, the object is written straight into `filename`, as `awss3kdb` did. Use it when
+something tracks the download by its final path: its size while in flight, or deleting it after a
+crash. The destination directory is still checked before the request is made. Its cost is that a
+failure loses the existing file: the SDK opens the destination as soon as a response arrives,
+before it knows whether that response is an error, so by then `filename` has been truncated. On
+failure it is removed rather than left holding a partial body or S3's error document. A failure
+before any response, such as a refused connection, leaves it untouched.
 
 **Example:**
 
 ```q
 bytes: sdk.getObject[client; "my-bucket"; "data/input.csv"; "download.csv"; ::]
+bytes: sdk.getObject[client; "my-bucket"; "data/input.csv"; "download.csv"; ([inPlace: 1b])]
+```
+
+## createTransferManager
+
+Creates a transfer manager, used by [`upload`](#upload) and [`download`](#download) to move large
+files as parts in parallel. Requires [`initialize`](#initialize) and a client from
+[`createClient`](#createclient).
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|client|foreign|A client from [`createClient`](#createclient)|
+|threads|long|Size of the manager's thread pool, from 1 to 64|
+|options|dict|Reserved for future options; pass `::` or an empty dictionary|
+
+**Returns:** a foreign object holding the transfer manager. It keeps its client alive, so the
+client handle can be dropped while the transfer manager is in use. It is garbage collected when its
+refcount drops to zero, and is invalidated by [`shutDown`](#shutdown) in the same way as a client.
+
+Each thread works on one 5 MB part at a time, with a buffer of its own. The threads and buffers are
+created along with the transfer manager, so it allocates 5 MB per thread straight away: 320 MB at
+the maximum of 64. A transfer cannot use more connections than its client allows, so threads
+beyond the client's `maxConnections`, 25 by default, wait for a connection rather than adding
+throughput.
+
+**Example:**
+
+```q
+client: sdk.createClient[([region: "eu-west-1"])]
+tm: sdk.createTransferManager[client; 6; ::]
+```
+
+## upload
+
+Uploads a local file to S3 through a transfer manager, blocking until it finishes. Requires
+[`initialize`](#initialize) and a transfer manager from
+[`createTransferManager`](#createtransfermanager).
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|transferManager|foreign|A transfer manager from [`createTransferManager`](#createtransfermanager)|
+|bucket|string\|symbol|Destination bucket|
+|key|string\|symbol|Destination object key|
+|filename|string\|symbol|Local file to upload|
+|options|dict|Reserved for future options; pass `::` or an empty dictionary|
+
+**Returns:** a long containing the number of bytes uploaded.
+
+A file of up to 5 MB is sent with a single `PutObject`. A larger one is sent as a multipart upload,
+its 5 MB parts spread across the transfer manager's threads. Unlike [`putObject`](#putobject), this
+is not limited to 5 GB, but with 5 MB parts and S3's limit of 10,000 parts per upload, a file can
+be at most about 50 GB. The object is stored with the content type `application/octet-stream`.
+
+A `filename` that is not a regular file, such as a directory, or that does not exist is rejected
+before an S3 request is made, as is a file too large for 10,000 parts. The file must not change
+while it is being uploaded: it is read part by part as the upload proceeds, so a file written to
+meanwhile can produce an object that matches no version of it.
+
+If a multipart upload fails, it is aborted before `upload` returns, so the parts already sent do
+not stay in S3. They would otherwise be stored, and billed, indefinitely. If the abort also fails,
+both errors are reported. A process that dies mid-upload cannot abort it; a bucket lifecycle rule
+with `AbortIncompleteMultipartUpload` removes such uploads after a set number of days.
+
+**Example:**
+
+```q
+bytes: sdk.upload[tm; "my-bucket"; "data/input.parquet"; "input.parquet"; ::]
+```
+
+## download
+
+Downloads an S3 object to a local file through a transfer manager, blocking until it finishes.
+Requires [`initialize`](#initialize) and a transfer manager from
+[`createTransferManager`](#createtransfermanager).
+
+**Parameters:**
+
+|Name|Type|Description|
+|---|---|---|
+|transferManager|foreign|A transfer manager from [`createTransferManager`](#createtransfermanager)|
+|bucket|string\|symbol|Source bucket|
+|key|string\|symbol|Source object key|
+|filename|string\|symbol|Local destination file|
+|options|dict|Options, or `::` for the defaults|
+
+**Options:**
+
+|Name|Type|Default|Description|
+|---|---|---|---|
+|inPlace|boolean\|long|`0b`|Write straight into `filename` instead of through a temporary file. See below|
+
+**Returns:** a long containing the number of bytes downloaded.
+
+The transfer manager first asks S3 for the object's size, then fetches it in 5 MB ranges spread
+across its threads. As with [`getObject`](#getobject), it is written by default to a temporary file
+beside `filename`, which replaces the destination after a complete, successful download, so a
+failure leaves an existing destination untouched. The same notes apply: the directory needs free
+space for the whole object, and a symbolic link or an existing file's permissions are not kept.
+
+With `inPlace`, the ranges are written straight into `filename`, as `awss3kdb` did, for callers
+that track a download by its final path. The size request comes first, so a missing object or a
+permission failure leaves `filename` untouched, since that request fails before anything is
+written. A failure part-way through leaves it partial, and
+because ranges are written at their own offsets, possibly already at the object's full size with
+gaps that read as zeros: in place, the file's size does not show whether the download completed.
+
+**Example:**
+
+```q
+bytes: sdk.download[tm; "my-bucket"; "data/input.parquet"; "input.parquet"; ::]
+bytes: sdk.download[tm; "my-bucket"; "data/input.parquet"; "input.parquet"; ([inPlace: 1b])]
 ```

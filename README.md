@@ -8,6 +8,7 @@ This project is a KDB-X module that wraps the official AWS sdk.
 - S3 client creation
 - Listing S3 objects, with or without object metadata
 - Uploading and downloading S3 objects
+- Parallel multipart uploads and downloads through a transfer manager
 
 ## API Documentation
 
