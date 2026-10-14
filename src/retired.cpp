@@ -47,10 +47,6 @@ std::atomic<bool> prune_queued(false);
 // never be shown idle, so it is never shut down.
 std::atomic<bool> untracked(false);
 
-void stop_ticker() {
-    ticking = false;
-}
-
 void start_ticker() {
     if (ticking) { return; }
     try {
@@ -103,13 +99,6 @@ bool is_idle(const Retired & entry) {
     return entry.object.use_count() == 1 && (!entry.idle || entry.idle());
 }
 
-bool is_retired(const void * object) {
-    for (const Retired & entry : retired()) {
-        if (entry.object.get() == object) { return true; }
-    }
-    return false;
-}
-
 }  // namespace
 
 void prune_retired() {
@@ -130,7 +119,7 @@ void prune_retired() {
             progress = true;
         }
     }
-    if (entries.empty()) { stop_ticker(); } else { start_ticker(); }
+    if (entries.empty()) { ticking = false; } else { start_ticker(); }
 }
 
 void keep_forever(std::shared_ptr<void> object) noexcept {
@@ -146,13 +135,12 @@ void keep_forever(std::shared_ptr<void> object) noexcept {
 }
 
 void retire(std::shared_ptr<void> object, std::function<bool()> idle,
-        std::function<void()> after, std::chrono::milliseconds patience) noexcept {
+        std::function<void()> after) noexcept {
     try {
         if (!object) {
             if (after) { after(); }
             return;
         }
-        const void * raw = object.get();
         Retired entry;
         entry.object = object;
         entry.idle = std::move(idle);
@@ -160,12 +148,8 @@ void retire(std::shared_ptr<void> object, std::function<bool()> idle,
         retired().push_back(std::move(entry));
         object.reset();
 
+        // Most often the SDK has let go already, and it goes at once.
         prune_retired();
-        const auto deadline = std::chrono::steady_clock::now() + patience;
-        while (is_retired(raw) && std::chrono::steady_clock::now() < deadline) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            prune_retired();
-        }
     } catch (...) {
         // Out of memory, most likely. If it was never stored, `object` still
         // holds it: kept rather than released, since releasing it here could

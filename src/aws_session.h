@@ -35,4 +35,12 @@ class AwsSession {
 K initialize(K options);
 K shutDown(K unused);
 
+// The checks a module function taking an options dictionary starts with: the
+// SDK must be initialized, and the options must be a dictionary or the generic
+// null (101h), which is how a caller passes "no options". Also destroys any
+// retired SDK objects that have become idle. NULL if the call may go ahead,
+// otherwise the error to raise -- as `return krr((S)error)`, since krr itself
+// returns NULL rather than an error object.
+const char * check_call(K options);
+
 }
