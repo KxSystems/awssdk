@@ -143,13 +143,7 @@ K key_table(const std::vector<Aws::S3::Model::Object> & objects) {
 }  // namespace
 
 K listObjects(K client, K bucket, K options) {
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    // 101 is the generic null, which is how a caller passes "no options".
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         const std::vector<Aws::S3::Model::Object> objects =
@@ -173,12 +167,7 @@ K listObjects(K client, K bucket, K options) {
 }
 
 K listObjectsMetadata(K client, K bucket, K options) {
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         // Owner is requested here but not by listObjects. It needs no second
@@ -223,12 +212,7 @@ K listObjectsMetadata(K client, K bucket, K options) {
 }
 
 K putObject(K client, K bucket, K key, K filename, K options) {
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         const ObjectFileArgs args = object_file_args(bucket, key, filename);
@@ -258,12 +242,7 @@ K putObject(K client, K bucket, K key, K filename, K options) {
 }
 
 K getObject(K client, K bucket, K key, K filename, K options) {
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         const ObjectFileArgs args = object_file_args(bucket, key, filename);

@@ -137,6 +137,13 @@ K initialize(K options) {
   }
 }
 
+const char * check_call(K options) {
+  if (!AwsSession::getInstance().isInitialized()) { return "uninitialized"; }
+  prune_retired();
+  if (options == nullptr || (options->t != XD && options->t != 101)) { return "type"; }
+  return nullptr;
+}
+
 K shutDown(K) {
   try {
     return kb(AwsSession::getInstance().shutDown());

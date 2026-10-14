@@ -13,7 +13,6 @@
 
 #include "aws_session.h"
 #include "handle_registry.h"
-#include "retired.h"
 #include "s3_client.h"
 #include "s3_client_handle.h"
 #include "utils.h"
@@ -29,13 +28,7 @@ const char * const client_options[] = {
     "connectTimeout", "requestTimeout", "maxConnections"
 };
 
-// A client is idle once nothing else holds it: transfer managers using it
-// hold references, and their SDK threads hold those.
-void retire_client(std::shared_ptr<Aws::S3::S3Client> client) {
-    retire(std::move(client));
-}
-
-HandleRegistry<Aws::S3::S3Client> clients("client", retire_client);
+HandleRegistry<Aws::S3::S3Client> clients("client");
 
 // Registered as each client foreign's destructor.
 K destroy_client(K handle) {
@@ -64,21 +57,7 @@ constexpr J UNSIGNED_FIELD_MAX = static_cast<J>(std::numeric_limits<unsigned>::m
 }  // namespace
 
 K createClient(K options) {
-    // This check and the client construction below are not one atomic step: a
-    // shutDown running in between would call Aws::ShutdownAPI while a client
-    // is still being built. That is safe only because q calls this module from
-    // a single thread, so createClient and shutDown cannot overlap. Step 5
-    // enables setm(1) for the async callbacks and removes that guarantee, at
-    // which point the session needs a read/write guard held across the whole
-    // of any operation that uses the SDK -- not just this one.
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    prune_retired();
-    // 101 is the generic null, which is how createClient[::] passes "no options".
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         const char * unknown = dict_unknown_key(options, client_options,

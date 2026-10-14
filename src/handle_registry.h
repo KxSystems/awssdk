@@ -4,12 +4,11 @@
 // does reach k.h: include it after every AWS header, like the other project
 // headers.
 #include <memory>
-#include <mutex>
 #include <set>
 #include <stdexcept>
-#include <vector>
 
 #include "k.h"
+#include "retired.h"
 
 
 namespace awssdk {
@@ -28,20 +27,18 @@ namespace awssdk {
 // The set is what makes an arbitrary 112h safe to reject rather than
 // dereference.
 //
-// Guarded because the paths that touch the registry -- wrap, the foreign
-// destructor q runs at garbage collection, and the shutDown sweep -- are serial
-// only while q calls this module from one thread. Enabling setm(1) for the
-// async callbacks lifts that guarantee.
+// Each object the registry lets go of is retired rather than destroyed here:
+// an SDK thread may still hold a reference, and must not be the one to release
+// it last (retired.h).
+//
+// Main thread only, like everything that reaches it: q calls the module, and
+// runs foreign destructors, on its main thread.
 template <class T>
 class HandleRegistry {
 public:
-    using Retire = void (*)(std::shared_ptr<T>);
-
     // `name` is the error a lookup raises for anything that is not a live
-    // handle of this kind. `retire` takes over each object the registry lets
-    // go of, rather than it being destroyed here: an SDK thread may still hold
-    // a reference, and must not be the one to release it last (retired.h).
-    HandleRegistry(const char * name, Retire retire) : name_(name), retire_(retire) {}
+    // handle of this kind.
+    explicit HandleRegistry(const char * name) : name_(name) {}
 
     HandleRegistry(const HandleRegistry &) = delete;
     HandleRegistry & operator=(const HandleRegistry &) = delete;
@@ -54,16 +51,12 @@ public:
         // insertion and the foreign have succeeded; release() comes last, and
         // never as an argument to a call that could itself throw.
         std::unique_ptr<Slot> slot(new Slot(std::move(object)));
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            live_.insert(slot.get());
-        }
+        live_.insert(slot.get());
 
         // knk is variadic, so the destructor is passed through untouched; q
         // reads kK(x)[0] as the destructor and kK(x)[1] as the payload.
         K foreign = knk(2, destructor, slot.get());
         if (foreign == nullptr) {
-            std::lock_guard<std::mutex> lock(mutex_);
             live_.erase(slot.get());
             throw std::runtime_error("alloc");
         }
@@ -88,7 +81,6 @@ public:
             throw std::invalid_argument(name_);
         }
 
-        std::lock_guard<std::mutex> lock(mutex_);
         Slot * found = slot(handle);
         if (live_.find(found) == live_.end()) { throw std::invalid_argument(name_); }
         // Emptied by a sweep: the handle is still ours, but its object is gone.
@@ -100,15 +92,8 @@ public:
     // freed.
     void release(K handle) {
         Slot * found = slot(handle);
-        bool owned = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            owned = live_.erase(found) != 0;
-        }
-        // Outside the lock: retiring can run SDK teardown, which must not
-        // happen with the registry held.
-        if (owned) {
-            if (*found) { retire_(std::move(*found)); }
+        if (live_.erase(found) != 0) {
+            if (*found) { retire(std::move(*found)); }
             delete found;
         }
     }
@@ -118,17 +103,9 @@ public:
     // SDK objects hold SDK resources, so this has to run before
     // Aws::ShutdownAPI.
     void sweep() {
-        std::vector<Slot> taken;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            taken.reserve(live_.size());
-            for (Slot * each : live_) {
-                if (*each) { taken.push_back(*each); }
-                each->reset();
-            }
+        for (Slot * each : live_) {
+            if (*each) { retire(std::move(*each)); }
         }
-        // Retired outside the lock, as in release().
-        for (Slot & each : taken) { retire_(std::move(each)); }
     }
 
 private:
@@ -142,9 +119,7 @@ private:
     }
 
     const char * name_;
-    Retire retire_;
     std::set<Slot *> live_;
-    std::mutex mutex_;
 };
 
 }
