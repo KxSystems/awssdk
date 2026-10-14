@@ -1,5 +1,5 @@
 context:
-  version: "0.0.3"
+  version: "0.1.0"
 
 package:
   name: q-kx-aws-sdk
@@ -23,7 +23,9 @@ requirements:
         - make
     - aws-sdk-cpp
   host:
-    - aws-sdk-cpp
+    # The version built and tested against. The run requirement is pinned to
+    # the exact version built with by aws-sdk-cpp's own run_exports.
+    - aws-sdk-cpp >=1.11.833
   run: 
     - aws-sdk-cpp
 
