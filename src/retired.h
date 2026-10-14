@@ -24,9 +24,18 @@ namespace awssdk {
 // `idle`, if given, also returns true. It is then destroyed, and `after` runs.
 // `patience` is how long to wait for that before leaving it to a later
 // prune_retired, for callers that want it done now if it can be.
+//
+// Never throws, as it is called from destructors: if it cannot keep track of
+// `object`, the object is kept for the rest of the process instead.
 void retire(std::shared_ptr<void> object, std::function<bool()> idle = nullptr,
     std::function<void()> after = nullptr,
-    std::chrono::milliseconds patience = std::chrono::milliseconds(0));
+    std::chrono::milliseconds patience = std::chrono::milliseconds(0)) noexcept;
+
+// Holds `object` for the rest of the process. For when it can be neither
+// destroyed safely nor retired. Nothing can then tell when the SDK is done with
+// it, so from then on drain_retired always returns false: the SDK is never
+// shut down.
+void keep_forever(std::shared_ptr<void> object) noexcept;
 
 // Destroys whatever has become idle. Called by the module's entry points; while
 // anything remains, it is also scheduled on q's main thread by itself, so that

@@ -42,6 +42,11 @@ std::atomic<bool> ticking(false);
 // One prune queued at a time, however long q's main thread is busy.
 std::atomic<bool> prune_queued(false);
 
+// Set once anything has had to be kept outside the list (keep_forever), where
+// nothing can tell when the SDK is done with it. From then on the SDK can
+// never be shown idle, so it is never shut down.
+std::atomic<bool> untracked(false);
+
 void stop_ticker() {
     ticking = false;
 }
@@ -57,7 +62,12 @@ void start_ticker() {
     }
     ticking = true;
     const unsigned generation = ++ticker_generation;
-    std::thread([generation]() {
+    // Thread creation can fail (std::system_error) when the process is out of
+    // threads or memory. This can be reached from a destructor, where an
+    // escaping exception would terminate q, so the failure is absorbed and
+    // cleanup falls back to the next call into the module.
+    try {
+        std::thread worker([generation]() {
         std::chrono::milliseconds delay(10);
         while (ticking && ticker_generation == generation) {
             std::this_thread::sleep_for(delay);
@@ -70,7 +80,21 @@ void start_ticker() {
                 });
             }
         }
-    }).detach();
+        });
+        try {
+            worker.detach();
+        } catch (...) {
+            // A joinable std::thread must not be destroyed, so it is stopped and
+            // joined instead: it leaves its loop within one sleep, at most a
+            // second.
+            ticking = false;
+            worker.join();
+            throw;
+        }
+    } catch (const std::exception &) {
+        ticking = false;
+        std::fprintf(stderr, "awssdk: could not start the cleanup thread; cleanup waits for the next call\n");
+    }
 }
 
 // use_count is exact when it reads 1: no other owner exists, so none can make
@@ -109,28 +133,49 @@ void prune_retired() {
     if (entries.empty()) { stop_ticker(); } else { start_ticker(); }
 }
 
-void retire(std::shared_ptr<void> object, std::function<bool()> idle,
-        std::function<void()> after, std::chrono::milliseconds patience) {
-    if (!object) {
-        if (after) { after(); }
-        return;
+void keep_forever(std::shared_ptr<void> object) noexcept {
+    // First, before the allocation below, which may fail too.
+    if (!untracked.exchange(true)) {
+        std::fprintf(stderr, "awssdk: lost track of an SDK object; the SDK will not be shut down\n");
     }
-    const void * raw = object.get();
-    Retired entry;
-    entry.object = std::move(object);
-    entry.idle = std::move(idle);
-    entry.after = std::move(after);
-    retired().push_back(std::move(entry));
+    try {
+        new std::shared_ptr<void>(std::move(object));
+    } catch (...) {
+        // Nothing left to try: the object is released with `object`.
+    }
+}
 
-    prune_retired();
-    const auto deadline = std::chrono::steady_clock::now() + patience;
-    while (is_retired(raw) && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+void retire(std::shared_ptr<void> object, std::function<bool()> idle,
+        std::function<void()> after, std::chrono::milliseconds patience) noexcept {
+    try {
+        if (!object) {
+            if (after) { after(); }
+            return;
+        }
+        const void * raw = object.get();
+        Retired entry;
+        entry.object = object;
+        entry.idle = std::move(idle);
+        entry.after = std::move(after);
+        retired().push_back(std::move(entry));
+        object.reset();
+
         prune_retired();
+        const auto deadline = std::chrono::steady_clock::now() + patience;
+        while (is_retired(raw) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            prune_retired();
+        }
+    } catch (...) {
+        // Out of memory, most likely. If it was never stored, `object` still
+        // holds it: kept rather than released, since releasing it here could
+        // destroy it while an SDK thread is still using it.
+        if (object) { keep_forever(std::move(object)); }
     }
 }
 
 bool drain_retired(std::chrono::milliseconds limit) {
+    if (untracked) { return false; }
     const auto deadline = std::chrono::steady_clock::now() + limit;
     prune_retired();
     while (!retired().empty() && std::chrono::steady_clock::now() < deadline) {

@@ -7,6 +7,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -52,14 +53,24 @@ struct TransferManagerHandle : ManagerParts {
     // last, the parts are retired rather than destroyed: the SDK's tasks hold
     // the manager, and it holds its client. They are idle once no task does.
     ~TransferManagerHandle() {
-        std::shared_ptr<ManagerParts> parts = std::make_shared<ManagerParts>();
-        parts->executor = std::move(executor);
-        parts->manager = std::move(manager);
-        parts->client = std::move(client);
-        const ManagerParts * raw = parts.get();
-        retire(std::move(parts), [raw]() {
-            return !raw->manager || raw->manager.use_count() == 1;
-        });
+        try {
+            std::shared_ptr<ManagerParts> parts = std::make_shared<ManagerParts>();
+            parts->executor = std::move(executor);
+            parts->manager = std::move(manager);
+            parts->client = std::move(client);
+            const ManagerParts * raw = parts.get();
+            retire(std::move(parts), [raw]() {
+                return !raw->manager || raw->manager.use_count() == 1;
+            });
+        } catch (...) {
+            // Out of memory: an exception leaving a destructor would terminate
+            // q, and destroying these here could pull them from under an SDK
+            // thread, so they are kept instead, in an order that keeps the
+            // executor alive at least as long as the manager.
+            keep_forever(std::move(executor));
+            keep_forever(std::move(manager));
+            keep_forever(std::move(client));
+        }
     }
 };
 
@@ -119,6 +130,18 @@ std::shared_ptr<Aws::Transfer::TransferHandle> start_upload(const TransferManage
     return tm.manager->UploadFile(args.filename.c_str(), args.bucket.c_str(),
         args.key.c_str(), "application/octet-stream",
         Aws::Map<Aws::String, Aws::String>(), context);
+}
+
+// Blocks the q thread until the SDK has let go of a transfer's handle, for at
+// most a few seconds. A completed download's file can still be open when its
+// status says COMPLETED: up to 5 MB it is fetched in one request whose result
+// owns the file stream, and that result goes only when the SDK's task returns,
+// after the status is set. The task holds the handle until then, so once this
+// is its only owner the file is closed -- which a rename needs on Windows.
+void wait_for_release(const std::shared_ptr<Aws::Transfer::TransferHandle> & handle) {
+    for (int waited = 0; waited < 5000 && handle.use_count() > 1; ++waited) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 }
 
 // Blocks the q thread until the transfer finishes. WaitUntilFinished also
@@ -188,6 +211,12 @@ struct AsyncTransfer {
     // Downloads only.
     std::shared_ptr<DownloadTarget> target;
 
+    // A completed download waiting for the SDK to let go of its handle before
+    // the rename (see deliver), with the counts its COMPLETED report carried.
+    bool awaiting_release = false;
+    J completed_transferred = 0;
+    J completed_total = 0;
+
     // Set once the outcome has been acted on -- the temporary renamed or
     // removed, a failed upload aborted -- by the final report or by shutDown.
     bool settled = false;
@@ -238,8 +267,14 @@ const char * status_name(TransferStatus status) {
 void settle(AsyncTransfer & t, TransferStatus status, std::string error,
         J transferred, J total) {
     if (t.settled) { return; }
-    const bool completed = status == TransferStatus::COMPLETED;
-    if (completed && t.target) {
+    // What the SDK reported, deliberately, rather than the outcome below: a
+    // completed download is settled only once its file is closed -- either the
+    // SDK has let go of the handle (deliver), or shutDown has waited for every
+    // task to finish -- so even if the rename then fails, the temporary can be
+    // removed straight away.
+    const bool sdk_completed = status == TransferStatus::COMPLETED;
+    if (sdk_completed && t.target) {
+        t.handle.reset();
         try {
             t.target->commit();
         } catch (const std::exception & exc) {
@@ -251,7 +286,7 @@ void settle(AsyncTransfer & t, TransferStatus status, std::string error,
             && (status == TransferStatus::FAILED || status == TransferStatus::CANCELED)) {
         error += abort_failed_upload(*t.tm, *t.handle);
     }
-    if (t.target && !completed) {
+    if (t.target && !sdk_completed) {
         retire_unfinished_download(std::move(t.handle), std::move(t.target));
     }
     t.handle.reset();
@@ -300,6 +335,21 @@ void report(const AsyncTransfer & t, TransferStatus status, J transferred, J tot
 // On the main thread: delivers one report. The first final report for a
 // transfer is its last -- the SDK can report a final status more than once,
 // when parts finish together -- and anything after it is dropped.
+// The continuation of a completed download that waited for the SDK to release
+// its handle (see deliver): with the handle gone the file is closed, so the
+// rename happens here, at once. It runs on the main thread wherever retired
+// objects are pruned -- including shutDown's drain -- so no rename is left
+// pending once shutDown returns, to land on a file written after it. Only the
+// report is deferred to q's event loop.
+void settle_released(uint64_t id) {
+    std::map<uint64_t, std::unique_ptr<AsyncTransfer>> & transfers = in_flight();
+    auto found = transfers.find(id);
+    if (found == transfers.end() || !found->second->awaiting_release) { return; }
+    AsyncTransfer & t = *found->second;
+    t.awaiting_release = false;
+    settle(t, TransferStatus::COMPLETED, "", t.completed_transferred, t.completed_total);
+}
+
 void deliver(uint64_t id, TransferStatus status, J transferred, J total,
         const std::string & error) {
     prune_retired();
@@ -308,8 +358,32 @@ void deliver(uint64_t id, TransferStatus status, J transferred, J total,
     if (found == transfers.end()) { return; }
 
     AsyncTransfer & t = *found->second;
-    if (!t.settled && !is_final(status)) {
+    if (t.awaiting_release) {
+        // Settled by the release, which then posts the report. A duplicate
+        // COMPLETED, or the report shutDown posts, is dropped meanwhile.
+        return;
+    } else if (!t.settled && !is_final(status)) {
         report(t, status, transferred, total, error);
+        return;
+    } else if (!t.settled && status == TransferStatus::COMPLETED && t.target
+            && !t.target->in_place() && t.handle && t.handle.use_count() > 1) {
+        // The SDK may still have the file open: up to 5 MB, the request's
+        // result owns the file stream until the SDK's task returns, which is
+        // after the status is set. The task holds the handle until then. So
+        // the handle is retired, and its release settles the transfer
+        // (settle_released) and posts the report, which then comes back here
+        // and is delivered from q's event loop, like every other report,
+        // rather than from inside retirement. The manager is not needed again.
+        t.awaiting_release = true;
+        t.completed_transferred = transferred;
+        t.completed_total = total;
+        t.tm.reset();
+        retire(std::move(t.handle), nullptr, [id]() {
+            settle_released(id);
+            post_to_main([id]() {
+                deliver(id, TransferStatus::COMPLETED, 0, 0, "");
+            });
+        });
         return;
     }
 
@@ -484,8 +558,13 @@ K download(K manager, K bucket, K key, K filename, K options) {
             retire_unfinished_download(std::move(transfer), target);
             throw std::runtime_error(error);
         }
+        // Past the bound the rename is tried anyway, which works wherever an
+        // open file can be renamed.
+        wait_for_release(transfer);
+        const J bytes = static_cast<J>(transfer->GetBytesTotalSize());
+        transfer.reset();
         target->commit();
-        return kj(static_cast<J>(transfer->GetBytesTotalSize()));
+        return kj(bytes);
     } catch (const std::exception & exc) {
         return krr_text(exc.what());
     }
