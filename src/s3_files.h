@@ -75,6 +75,8 @@ public:
     // Moves a completed temporary over the destination. Nothing to do in place.
     void commit();
 
+    bool in_place() const { return in_place_; }
+
     // In place, records that the download has begun writing the destination,
     // so that it is removed if the download is not committed: by then it has
     // been truncated, and may hold a partial body or an error document. The

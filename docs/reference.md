@@ -58,7 +58,7 @@ Shuts down the SDK. Call it before exiting the session.
 
 Transfers started by [`uploadAsync`](#uploadasync) or [`downloadAsync`](#downloadasync) and still running are canceled, and `shutDown` waits for them to stop before returning. Each one's callback still receives a final report, normally `` `CANCELED ``, once q's event loop next runs: a download through a temporary file leaves no file behind, and a multipart upload is aborted.
 
-The SDK's own threads can still be finishing work for a few moments after a transfer ends. `shutDown` waits up to 10 seconds for them before shutting the SDK down. If they are still busy after that, it signals `'busy` and leaves the SDK initialized, since shutting it down under them is unsafe; every handle is already invalidated, and calling `shutDown` again completes it once they are done.
+The SDK's own threads can still be finishing work for a few moments after a transfer ends. `shutDown` waits up to 10 seconds for them before shutting the SDK down. If they are still busy after that, it signals `'busy` and leaves the SDK initialized, since shutting it down under them is unsafe; every handle is already invalidated, and calling `shutDown` again completes it once they are done. In the unlikely event that the module could not keep track of an SDK object, for example because memory ran out, `shutDown` signals `'busy` from then on, and the SDK is left running until the process exits.
 
 **Example:**
 
@@ -539,9 +539,11 @@ The callback is called on q's main thread, whenever q's event loop is idle, with
 |total|long|Size of the object, once known|
 |error|string|Why the transfer failed; empty otherwise|
 
-A transfer is reported each time it changes status and, while downloading, after each 5 MB part,
-then exactly once with a final status, after which nothing more is reported for it. The keys and
-values match those `awss3kdb` reported, so callbacks written for it work unchanged.
+A transfer is reported as it progresses, then exactly once with a final status, after which nothing
+more is reported for it. How often it is reported along the way is up to the AWS SDK: with the
+current version, once as it starts and after each 5 MB part, in either direction. For an upload,
+`transferred` can end slightly above `total`. The keys and values match those `awss3kdb` reported,
+so callbacks written for it work unchanged.
 
 An error signalled by the callback is printed to standard error and has no other effect: the
 transfer and other transfers' reports carry on. Reports are delivered only while q's event loop
@@ -587,6 +589,9 @@ default the temporary file has already replaced `filename` when the callback rec
 `` `COMPLETED ``, so the callback can read the file. After any other final status the temporary is
 removed once the SDK has closed it: normally before the callback runs, otherwise moments after. An unwritable destination directory is an error from this call; anything that goes wrong
 once the download has started is reported to the callback.
+
+Two downloads to the same `filename` at the same time finish in no particular order: either may
+be the one left in place.
 
 **Example:**
 

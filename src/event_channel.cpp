@@ -1,4 +1,6 @@
 // System headers first; the project headers below pull in k.h, which must come last.
+#include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -57,7 +59,9 @@ bool wakeup_pending = false;
 
 Socket read_end;
 Socket write_end;
-bool attached = false;
+// Read by SDK threads in post_to_main, so atomic; set once, on the main thread,
+// after the descriptors above.
+std::atomic<bool> attached(false);
 
 #ifdef _WIN32
 // Windows has no socketpair, so two sockets are connected over loopback. The
@@ -103,8 +107,13 @@ bool make_pair(Socket & reader, Socket & writer) {
         return false;
     }
 
+    // A blocking writer could deadlock against shutDown, so this is required.
     u_long nonblocking = 1;
-    ioctlsocket(connecting, FIONBIO, &nonblocking);
+    if (ioctlsocket(connecting, FIONBIO, &nonblocking) != 0) {
+        closesocket(connecting);
+        closesocket(accepted);
+        return false;
+    }
     reader = accepted;
     writer = connecting;
     return true;
@@ -113,7 +122,13 @@ bool make_pair(Socket & reader, Socket & writer) {
 bool make_pair(Socket & reader, Socket & writer) {
     Socket ends[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, ends) != 0) { return false; }
-    fcntl(ends[1], F_SETFL, fcntl(ends[1], F_GETFL) | O_NONBLOCK);
+    // A blocking writer could deadlock against shutDown, so this is required.
+    const int flags = fcntl(ends[1], F_GETFL);
+    if (flags == -1 || fcntl(ends[1], F_SETFL, flags | O_NONBLOCK) == -1) {
+        close(ends[0]);
+        close(ends[1]);
+        return false;
+    }
     reader = ends[0];
     writer = ends[1];
     return true;
@@ -148,26 +163,54 @@ K on_readable(I) {
     return (K)0;
 }
 
+// Writes the wake-up byte. True if q will wake: the byte was written, or the
+// socket is full, which means a byte is already waiting to be read.
+bool send_wakeup() {
+    const char byte = 0;
+    for (;;) {
+#ifdef _WIN32
+        if (send(write_end, &byte, 1, 0) == 1) { return true; }
+        const int error = WSAGetLastError();
+        if (error == WSAEINTR) { continue; }
+        return error == WSAEWOULDBLOCK;
+#else
+#ifdef MSG_NOSIGNAL
+        const ssize_t sent = send(write_end, &byte, 1, MSG_NOSIGNAL);
+#else
+        const ssize_t sent = send(write_end, &byte, 1, 0);
+#endif
+        if (sent == 1) { return true; }
+        if (errno == EINTR) { continue; }
+        return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+    }
+}
+
+// Wakes q if there is work and no wake-up is outstanding. Before the channel is
+// attached there is nothing to write to: the work waits, and attaching wakes
+// q for it.
+void wake_if_needed() {
+    std::lock_guard<std::mutex> lock(queue_mutex());
+    if (!attached || wakeup_pending || queue().empty()) { return; }
+    // Sent with the lock held, which is safe because the socket never blocks,
+    // so that no other thread can see a wake-up claimed that was never sent:
+    // the flag is set only once the byte is on its way. If it is lost, the
+    // flag stays clear and the next post tries again.
+    if (send_wakeup()) {
+        wakeup_pending = true;
+        return;
+    }
+    std::fprintf(stderr, "awssdk: could not wake q's event loop; retrying on the next event\n");
+}
+
 }  // namespace
 
 void post_to_main(std::function<void()> fn) {
-    bool wake = false;
     {
         std::lock_guard<std::mutex> lock(queue_mutex());
         queue().push_back(std::move(fn));
-        if (!wakeup_pending) {
-            wakeup_pending = true;
-            wake = true;
-        }
     }
-    if (wake) {
-        const char byte = 0;
-#ifdef MSG_NOSIGNAL
-        send(write_end, &byte, 1, MSG_NOSIGNAL);
-#else
-        send(write_end, &byte, 1, 0);
-#endif
-    }
+    wake_if_needed();
 }
 
 void attach_event_channel() {
@@ -189,6 +232,7 @@ void attach_event_channel() {
     }
     r0(result);
     attached = true;
+    wake_if_needed();
 }
 
 }
