@@ -18,6 +18,8 @@ t.assertError[{aws.getObject[::;"bucket";"key";"file";::]};"uninitialized";::]
 t.assertError[{aws.createTransferManager[::;1;::]};"uninitialized";::]
 t.assertError[{aws.upload[::;"bucket";"key";"file";::]};"uninitialized";::]
 t.assertError[{aws.download[::;"bucket";"key";"file";::]};"uninitialized";::]
+t.assertError[{aws.uploadAsync[::;"bucket";"key";"file";([callback:{x}])]};"uninitialized";::]
+t.assertError[{aws.downloadAsync[::;"bucket";"key";"file";([callback:{x}])]};"uninitialized";::]
 t.assertFalse[{aws.shutDown[::]};::]
 
 t.feature `initialize
@@ -166,6 +168,34 @@ t.assertError[{system "truncate -s 60G awssdk_test_sparse"; r:@[aws.upload[tm;"b
 t.assertError[{aws.download[tm;"bucket";"key";"/no/such/awssdk-dir/output";::]};"unable to write file: /no/such/awssdk-dir/output";::]
 t.assertError[{aws.download[tm;"bucket";"key";"/no/such/awssdk-dir/output";([inPlace:1b])]};"unable to write file: /no/such/awssdk-dir/output";::]
 
+t.feature `asyncTransfer
+// Everything an async transfer rejects before starting, so none of these
+// reaches S3. Reports arrive only once q's event loop runs, after this script,
+// so delivery is covered by the live tests against MinIO.
+t.before[{tm::aws.createTransferManager[aws.createClient[::];2;::]}]
+// The callback is required, and has to be something q can apply.
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";::]};"callback";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";()!()]};"callback";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:42])]};"callback";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:(::)])]};"callback";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"file";([callback:"f"])]};"callback";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"file";1 2 3]};"type";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"file";([callback:{x};inPlace:1b])]};"inPlace";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:{x};partSize:1])]};"partSize";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:{x};inPlace:"yes"])]};"inPlace";::]
+t.assertError[{aws.uploadAsync[42;"bucket";"key";"file";([callback:{x}])]};"transferManager";::]
+t.assertError[{aws.downloadAsync[aws.createClient[::];"bucket";"key";"file";([callback:{x}])]};"transferManager";::]
+t.assertError[{aws.uploadAsync[tm;42;"key";"file";([callback:{x}])]};"bucket";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";42;"file";([callback:{x}])]};"key";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";42;([callback:{x}])]};"filename";::]
+// The same local checks as the blocking functions, raised at the call rather
+// than reported through the callback.
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"/tmp";([callback:{x}])]};"unable to read file: /tmp";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"/no/such/awssdk-input";([callback:{x}])]};"unable to read file: /no/such/awssdk-input";::]
+t.assertError[{system "truncate -s 60G awssdk_test_sparse"; r:@[aws.uploadAsync[tm;"bucket";"key";;([callback:{x}])]; "awssdk_test_sparse"; {hdel `:awssdk_test_sparse; 'x}]; hdel `:awssdk_test_sparse; r};"unable to upload file: awssdk_test_sparse needs more than 10000 parts of 5 MB";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"/no/such/awssdk-dir/output";([callback:{x}])]};"unable to write file: /no/such/awssdk-dir/output";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"/no/such/awssdk-dir/output";([callback:{x};inPlace:1b])]};"unable to write file: /no/such/awssdk-dir/output";::]
+
 t.feature `staleHandles
 // Handles that outlive a shutDown. kx.test deletes t.before globals at every
 // feature boundary, so they are created and swept within this feature: a
@@ -193,6 +223,8 @@ t.assertError[{aws.getObject[oldClient;"bucket";"key";"file";::]};"client";::]
 t.assertError[{aws.createTransferManager[oldClient;1;::]};"client";::]
 t.assertError[{aws.upload[oldTm;"bucket";"key";"/tmp";::]};"transferManager";::]
 t.assertError[{aws.download[oldTm;"bucket";"key";"file";::]};"transferManager";::]
+t.assertError[{aws.uploadAsync[oldTm;"bucket";"key";"/tmp";([callback:{x}])]};"transferManager";::]
+t.assertError[{aws.downloadAsync[oldTm;"bucket";"key";"file";([callback:{x}])]};"transferManager";::]
 // Dropping the old handles frees only their own slots: every fresh handle
 // still resolves. A manager lookup precedes the file check, so the file error
 // shows the manager was found.

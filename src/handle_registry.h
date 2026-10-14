@@ -35,9 +35,13 @@ namespace awssdk {
 template <class T>
 class HandleRegistry {
 public:
+    using Retire = void (*)(std::shared_ptr<T>);
+
     // `name` is the error a lookup raises for anything that is not a live
-    // handle of this kind.
-    explicit HandleRegistry(const char * name) : name_(name) {}
+    // handle of this kind. `retire` takes over each object the registry lets
+    // go of, rather than it being destroyed here: an SDK thread may still hold
+    // a reference, and must not be the one to release it last (retired.h).
+    HandleRegistry(const char * name, Retire retire) : name_(name), retire_(retire) {}
 
     HandleRegistry(const HandleRegistry &) = delete;
     HandleRegistry & operator=(const HandleRegistry &) = delete;
@@ -101,9 +105,12 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             owned = live_.erase(found) != 0;
         }
-        // Freed outside the lock: releasing an object runs SDK teardown, which
-        // must not happen with the registry held.
-        if (owned) { delete found; }
+        // Outside the lock: retiring can run SDK teardown, which must not
+        // happen with the registry held.
+        if (owned) {
+            if (*found) { retire_(std::move(*found)); }
+            delete found;
+        }
     }
 
     // Releases every live object, leaving their slots allocated so that
@@ -116,11 +123,12 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             taken.reserve(live_.size());
             for (Slot * each : live_) {
-                taken.push_back(*each);
+                if (*each) { taken.push_back(*each); }
                 each->reset();
             }
         }
-        // Released here, outside the lock, as in release().
+        // Retired outside the lock, as in release().
+        for (Slot & each : taken) { retire_(std::move(each)); }
     }
 
 private:
@@ -134,6 +142,7 @@ private:
     }
 
     const char * name_;
+    Retire retire_;
     std::set<Slot *> live_;
     std::mutex mutex_;
 };

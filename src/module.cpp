@@ -29,6 +29,8 @@ extern "C" {
     ADD_FN(createTransferManager, 3)
     ADD_FN(upload, 5)
     ADD_FN(download, 5)
+    ADD_FN(uploadAsync, 5)
+    ADD_FN(downloadAsync, 5)
     return xD(keys, values);
   }
 }

@@ -8,6 +8,7 @@
 
 #include "aws_session.h"
 #include "s3_client.h"
+#include "retired.h"
 #include "s3_transfer.h"
 #include "utils.h"
 
@@ -44,7 +45,12 @@ static bool parse_log_level(K options, Aws::Utils::Logging::LogLevel & log_level
 }
 
 static void shut_down_at_exit() {
-  AwsSession::getInstance().shutDown();
+  // If SDK threads are still busy, the SDK is left running: the process is
+  // ending anyway, and tearing it down under them would be worse.
+  try {
+    AwsSession::getInstance().shutDown();
+  } catch (const std::exception &) {
+  }
 }
 
 bool AwsSession::initialize(K options_k) {
@@ -85,19 +91,26 @@ bool AwsSession::initialize(K options_k) {
   return true;
 }
 
-// Must not run while any other call into the module is in progress: a call
-// in flight keeps its client or transfer manager alive past the sweep below,
-// and would then be using the SDK after ShutdownAPI. Today every entry point
-// runs on q's main thread and finishes its SDK work before returning, so they
-// cannot overlap. Enabling setm(1) for the async callbacks ends that, and is
-// when the session needs a shared/exclusive guard held across each operation.
+// Must not run while another call into the module is in progress. Every entry
+// point runs on q's main thread, so none can. The SDK's own threads can still
+// be running async transfers, so those are canceled and waited for first: no
+// SDK work may outlive ShutdownAPI.
 bool AwsSession::shutDown() {
   if (!initialized) return false;
   // Handles hold SDK resources, so they have to go before ShutdownAPI.
   // Transfer managers first: each one holds a client, which would otherwise
   // outlive the client sweep and be destroyed after ShutdownAPI.
+  cancel_all_async_transfers();
   destroy_all_transfer_managers();
   destroy_all_clients();
+  // The sweeps hand their objects over to be retired; SDK threads may still
+  // hold them. Every one has to be destroyed, here, before ShutdownAPI: an SDK
+  // thread still holding one is still doing SDK work. If they are not all done
+  // in time, the SDK is left initialized and the caller told, so that a later
+  // shutDown can finish the job. The swept handles stay inert either way.
+  if (!drain_retired(std::chrono::seconds(10))) {
+    throw std::runtime_error("busy");
+  }
   Aws::ShutdownAPI(options);
   initialized = false;
   return true;
@@ -125,7 +138,11 @@ K initialize(K options) {
 }
 
 K shutDown(K) {
-  return kb(AwsSession::getInstance().shutDown());
+  try {
+    return kb(AwsSession::getInstance().shutDown());
+  } catch (const std::exception & exc) {
+    return krr(ss((S)exc.what()));
+  }
 }
 
 }

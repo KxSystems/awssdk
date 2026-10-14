@@ -13,6 +13,7 @@
 
 #include "aws_session.h"
 #include "handle_registry.h"
+#include "retired.h"
 #include "s3_client.h"
 #include "s3_client_handle.h"
 #include "utils.h"
@@ -28,7 +29,13 @@ const char * const client_options[] = {
     "connectTimeout", "requestTimeout", "maxConnections"
 };
 
-HandleRegistry<Aws::S3::S3Client> clients("client");
+// A client is idle once nothing else holds it: transfer managers using it
+// hold references, and their SDK threads hold those.
+void retire_client(std::shared_ptr<Aws::S3::S3Client> client) {
+    retire(std::move(client));
+}
+
+HandleRegistry<Aws::S3::S3Client> clients("client", retire_client);
 
 // Registered as each client foreign's destructor.
 K destroy_client(K handle) {
@@ -67,6 +74,7 @@ K createClient(K options) {
     if (!AwsSession::getInstance().isInitialized()) {
         return krr("uninitialized");
     }
+    prune_retired();
     // 101 is the generic null, which is how createClient[::] passes "no options".
     if (options == nullptr || (options->t != XD && options->t != 101)) {
         return krr("type");
