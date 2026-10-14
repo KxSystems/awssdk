@@ -26,7 +26,7 @@ requirements:
     # The version built and tested against. The run requirement is pinned to
     # the exact version built with by aws-sdk-cpp's own run_exports.
     - aws-sdk-cpp >=1.11.833
-  run: 
+  run:
     - aws-sdk-cpp
 
 tests:
