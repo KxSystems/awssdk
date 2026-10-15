@@ -26,6 +26,12 @@ struct Retired {
 
 // Never destroyed, so that nothing still here at exit is destroyed after the
 // SDK has shut down.
+//
+// No lock: only q's main thread ever reaches this list. Every caller is a module
+// entry point, a handle's destructor, shutDown, or work posted to the main
+// thread; the helper thread and the SDK's threads never touch it. That holds
+// as long as the module is only called from q's main thread -- see "Threads" in
+// docs/reference.md.
 std::vector<Retired> & retired() {
     static auto * entries = new std::vector<Retired>();
     return *entries;

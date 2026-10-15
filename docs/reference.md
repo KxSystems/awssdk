@@ -2,6 +2,11 @@
 
 These are the API specifications for the aws-sdk module.
 
+**Threads:** call this module only from q's main thread. Do not call its functions inside `peach`
+or on q's secondary threads, and do not create handles there, since a handle that is released on
+a secondary thread runs its cleanup there. The module does its own work on background threads, but
+it relies on every call coming from the main thread.
+
 ## initialize
 
 Initializes the SDK. Must be called before any other function in this module.
