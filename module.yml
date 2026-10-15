@@ -1,6 +1,8 @@
 name: q-kx-awssdk
 description: >-
-  kdb-x APIs to authenticate using the AWS C++ SDK. 
+  kdb-x APIs for AWS, using the AWS C++ SDK: credential resolution, and S3
+  object listing, uploads and downloads, including parallel and asynchronous
+  transfers.
 homepage: https://github.com/KxSystems/awssdk
 namespace: kx.awssdk
 

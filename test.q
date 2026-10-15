@@ -13,6 +13,13 @@ t.assertError[{aws.getCredentials[::]};"uninitialized";::]
 t.assertError[{aws.createClient[::]};"uninitialized";::]
 t.assertError[{aws.listObjects[::;"bucket";::]};"uninitialized";::]
 t.assertError[{aws.listObjectsMetadata[::;"bucket";::]};"uninitialized";::]
+t.assertError[{aws.putObject[::;"bucket";"key";"file";::]};"uninitialized";::]
+t.assertError[{aws.getObject[::;"bucket";"key";"file";::]};"uninitialized";::]
+t.assertError[{aws.createTransferManager[::;1;::]};"uninitialized";::]
+t.assertError[{aws.upload[::;"bucket";"key";"file";::]};"uninitialized";::]
+t.assertError[{aws.download[::;"bucket";"key";"file";::]};"uninitialized";::]
+t.assertError[{aws.uploadAsync[::;"bucket";"key";"file";([callback:{x}])]};"uninitialized";::]
+t.assertError[{aws.downloadAsync[::;"bucket";"key";"file";([callback:{x}])]};"uninitialized";::]
 t.assertFalse[{aws.shutDown[::]};::]
 
 t.feature `initialize
@@ -25,8 +32,6 @@ t.assertMatch[{asc key creds};`accessKey`accountId`expiration`secretKey`sessionT
 t.assertType[{creds`expiration};"j";::]
 
 t.feature `createClient
-// The client is kept in a global so it is still live for the shutDown feature
-// below, which is what exercises the sweep that runs before Aws::ShutdownAPI.
 t.before[{client::aws.createClient[([region:"eu-west-1"])]}]
 t.assertMatch[{type client};112h;::]
 t.assertMatch[{type aws.createClient[::]};112h;::]
@@ -69,9 +74,6 @@ t.assertError[{aws.createClient[1 2 3]};"type";::]
 t.feature `shutDown
 t.assertTrue[{aws.shutDown[::]};::]
 t.assertFalse[{aws.shutDown[::]};::]
-
-// `client` is now a swept handle: q will garbage collect it later, which must
-// not double-free it.
 t.assertError[{aws.createClient[::]};"uninitialized";::]
 
 t.feature `listObjects
@@ -100,15 +102,134 @@ t.assertError[{aws.listObjectsMetadata[lo;42;::]};"bucket";::]
 t.assertError[{aws.listObjectsMetadata[lo;"bucket";1 2 3]};"type";::]
 t.assertError[{aws.listObjectsMetadata[lo;"bucket";([depth:1])]};"depth";::]
 
-t.feature `handleReuse
-// `client` from the createClient feature is a stale handle: the sweep emptied
-// its slot without freeing it. A freed allocation comes straight back on the
-// next new, so had the sweep freed slots instead, this stale handle would name
-// a client created after it and destroy the wrong one when dropped.
-t.before[{aws.initialize[::]; fresh::aws.createClient each 20#enlist ([region:"eu-west-1"])}]
-t.assertTrue[{all 112h=type each fresh};::]
-t.assertTrue[{client:: (::); .Q.gc[]; all sum 112h=type each fresh};::]
-t.assertMatch[{type aws.createClient[::]};112h;::]
+t.feature `objectTransfer
+// Argument validation and local upload failure need no S3 endpoint.
+t.before[{ot::aws.createClient[::]}]
+t.assertError[{aws.putObject[42;"bucket";"key";"file";::]};"client";::]
+t.assertError[{aws.getObject[42;"bucket";"key";"file";::]};"client";::]
+t.assertError[{aws.putObject[ot;42;"key";"file";::]};"bucket";::]
+t.assertError[{aws.putObject[ot;"bucket";42;"file";::]};"key";::]
+t.assertError[{aws.putObject[ot;"bucket";"key";42;::]};"filename";::]
+t.assertError[{aws.getObject[ot;"bucket";42;"file";::]};"key";::]
+t.assertError[{aws.getObject[ot;"bucket";"key";42;::]};"filename";::]
+t.assertError[{aws.putObject[ot;"bucket";"key";"file";1 2 3]};"type";::]
+t.assertError[{aws.putObject[ot;"bucket";"key";"file";([contentType:"text/plain"])]};"contentType";::]
+t.assertError[{aws.getObject[ot;"bucket";"key";"file";([versionId:"1"])]};"versionId";::]
+// An empty options dictionary is equivalent to ::. The missing input is
+// rejected before an HTTP request is attempted.
+t.assertError[{aws.putObject[ot;"bucket";"key";"/no/such/awssdk-input";()!()]};"unable to read file: /no/such/awssdk-input";::]
+// A directory opens as a stream on Linux and claims a size of INT64_MAX, so it
+// has to be rejected as not a regular file rather than sent.
+t.assertError[{aws.putObject[ot;"bucket";"key";"/tmp";::]};"unable to read file: /tmp";::]
+// The destination directory is probed before the request, so a local path
+// failure also avoids an unnecessary network call.
+t.assertError[{aws.getObject[ot;"bucket";"key";"/no/such/awssdk-dir/output";::]};"unable to write file: /no/such/awssdk-dir/output";::]
+// In place, the directory is probed the same way, without touching the
+// destination itself.
+t.assertError[{aws.getObject[ot;"bucket";"key";"/no/such/awssdk-dir/output";([inPlace:1b])]};"unable to write file: /no/such/awssdk-dir/output";::]
+t.assertError[{aws.getObject[ot;"bucket";"key";"file";([inPlace:"yes"])]};"inPlace";::]
+
+t.feature `transferManager
+// Creating a manager and validating transfer arguments need no S3 endpoint.
+t.before[{tc::aws.createClient[::]; tm::aws.createTransferManager[tc;2;::]}]
+t.assertMatch[{type tm};112h;::]
+t.assertMatch[{type aws.createTransferManager[tc;64;()!()]};112h;::]
+// A pool of no threads could never run a transfer.
+t.assertError[{aws.createTransferManager[tc;0;::]};"threads";::]
+t.assertError[{aws.createTransferManager[tc;-1;::]};"threads";::]
+// Each thread allocates its own 5 MB part buffer up front.
+t.assertError[{aws.createTransferManager[tc;65;::]};"threads";::]
+t.assertError[{aws.createTransferManager[tc;0Nj;::]};"threads";::]
+t.assertError[{aws.createTransferManager[tc;2i;::]};"threads";::]
+t.assertError[{aws.createTransferManager[42;2;::]};"client";::]
+t.assertError[{aws.createTransferManager[tc;2;1 2 3]};"type";::]
+t.assertError[{aws.createTransferManager[tc;2;([partSize:1])]};"partSize";::]
+// A client is not a transfer manager, nor the other way round.
+t.assertError[{aws.upload[tc;"bucket";"key";"file";::]};"transferManager";::]
+t.assertError[{aws.download[42;"bucket";"key";"file";::]};"transferManager";::]
+t.assertError[{aws.listObjects[tm;"bucket";::]};"client";::]
+t.assertError[{aws.upload[tm;42;"key";"file";::]};"bucket";::]
+t.assertError[{aws.upload[tm;"bucket";42;"file";::]};"key";::]
+t.assertError[{aws.upload[tm;"bucket";"key";42;::]};"filename";::]
+t.assertError[{aws.download[tm;42;"key";"file";::]};"bucket";::]
+t.assertError[{aws.download[tm;"bucket";42;"file";::]};"key";::]
+t.assertError[{aws.download[tm;"bucket";"key";42;::]};"filename";::]
+t.assertError[{aws.upload[tm;"bucket";"key";"file";1 2 3]};"type";::]
+t.assertError[{aws.download[tm;"bucket";"key";"file";1 2 3]};"type";::]
+t.assertError[{aws.upload[tm;"bucket";"key";"file";([inPlace:1b])]};"inPlace";::]
+t.assertError[{aws.download[tm;"bucket";"key";"file";([partSize:1])]};"partSize";::]
+t.assertError[{aws.download[tm;"bucket";"key";"file";([inPlace:"yes"])]};"inPlace";::]
+// The manager opens the upload source itself, so it is checked first.
+t.assertError[{aws.upload[tm;"bucket";"key";"/tmp";::]};"unable to read file: /tmp";::]
+t.assertError[{aws.upload[tm;"bucket";"key";"/no/such/awssdk-input";::]};"unable to read file: /no/such/awssdk-input";::]
+// Over 10,000 parts of 5 MB is rejected before anything is sent. A sparse
+// file has the size without the disk space.
+t.assertError[{system "truncate -s 60G awssdk_test_sparse"; r:@[aws.upload[tm;"bucket";"key";;::]; "awssdk_test_sparse"; {hdel `:awssdk_test_sparse; 'x}]; hdel `:awssdk_test_sparse; r};"unable to upload file: awssdk_test_sparse needs more than 10000 parts of 5 MB";::]
+t.assertError[{aws.download[tm;"bucket";"key";"/no/such/awssdk-dir/output";::]};"unable to write file: /no/such/awssdk-dir/output";::]
+t.assertError[{aws.download[tm;"bucket";"key";"/no/such/awssdk-dir/output";([inPlace:1b])]};"unable to write file: /no/such/awssdk-dir/output";::]
+
+t.feature `asyncTransfer
+// Everything an async transfer rejects before starting, so none of these
+// reaches S3. Reports arrive only once q's event loop runs, after this script,
+// so delivery is covered by the live tests against MinIO.
+t.before[{tm::aws.createTransferManager[aws.createClient[::];2;::]}]
+// The callback is required, and has to be something q can apply.
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";::]};"callback";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";()!()]};"callback";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:42])]};"callback";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:(::)])]};"callback";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"file";([callback:"f"])]};"callback";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"file";1 2 3]};"type";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"file";([callback:{x};inPlace:1b])]};"inPlace";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:{x};partSize:1])]};"partSize";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";([callback:{x};inPlace:"yes"])]};"inPlace";::]
+t.assertError[{aws.uploadAsync[42;"bucket";"key";"file";([callback:{x}])]};"transferManager";::]
+t.assertError[{aws.downloadAsync[aws.createClient[::];"bucket";"key";"file";([callback:{x}])]};"transferManager";::]
+t.assertError[{aws.uploadAsync[tm;42;"key";"file";([callback:{x}])]};"bucket";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";42;"file";([callback:{x}])]};"key";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";42;([callback:{x}])]};"filename";::]
+// The same local checks as the blocking functions, raised at the call rather
+// than reported through the callback.
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"/tmp";([callback:{x}])]};"unable to read file: /tmp";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";"/no/such/awssdk-input";([callback:{x}])]};"unable to read file: /no/such/awssdk-input";::]
+t.assertError[{system "truncate -s 60G awssdk_test_sparse"; r:@[aws.uploadAsync[tm;"bucket";"key";;([callback:{x}])]; "awssdk_test_sparse"; {hdel `:awssdk_test_sparse; 'x}]; hdel `:awssdk_test_sparse; r};"unable to upload file: awssdk_test_sparse needs more than 10000 parts of 5 MB";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"/no/such/awssdk-dir/output";([callback:{x}])]};"unable to write file: /no/such/awssdk-dir/output";::]
+t.assertError[{aws.downloadAsync[tm;"bucket";"key";"/no/such/awssdk-dir/output";([callback:{x};inPlace:1b])]};"unable to write file: /no/such/awssdk-dir/output";::]
+
+t.feature `staleHandles
+// Handles that outlive a shutDown. kx.test deletes t.before globals at every
+// feature boundary, so they are created and swept within this feature: a
+// handle from an earlier one would be gone, and since q's error for an
+// undefined `client` is 'client, an assertion on it would pass regardless.
+//
+// shutDown empties the old handles' slots without freeing them, so a fresh
+// handle can never land on a stale one's address. That reuse cannot be forced
+// from q -- building an SDK object makes many small allocations, which take a
+// freed slot first -- so what is checked is the deterministic part: stale
+// handles are rejected rather than resolved, which would crash, and dropping
+// them leaves every fresh handle intact.
+t.before[{
+    aws.initialize[::];
+    oldClient::aws.createClient[::];
+    oldTm::aws.createTransferManager[oldClient;1;::];
+    aws.shutDown[::];
+    aws.initialize[::];
+    freshClients::aws.createClient each 20#enlist ([region:"eu-west-1"]);
+    freshTms::aws.createTransferManager[;1;::] each 5#freshClients
+    }]
+t.assertError[{aws.listObjects[oldClient;"bucket";::]};"client";::]
+t.assertError[{aws.putObject[oldClient;"bucket";"key";"file";::]};"client";::]
+t.assertError[{aws.getObject[oldClient;"bucket";"key";"file";::]};"client";::]
+t.assertError[{aws.createTransferManager[oldClient;1;::]};"client";::]
+t.assertError[{aws.upload[oldTm;"bucket";"key";"/tmp";::]};"transferManager";::]
+t.assertError[{aws.download[oldTm;"bucket";"key";"file";::]};"transferManager";::]
+t.assertError[{aws.uploadAsync[oldTm;"bucket";"key";"/tmp";([callback:{x}])]};"transferManager";::]
+t.assertError[{aws.downloadAsync[oldTm;"bucket";"key";"file";([callback:{x}])]};"transferManager";::]
+// Dropping the old handles frees only their own slots: every fresh handle
+// still resolves. A manager lookup precedes the file check, so the file error
+// shows the manager was found.
+t.assertTrue[{oldClient::(::); oldTm::(::); all 112h=type each aws.createTransferManager[;1;::] each freshClients};::]
+t.assertError[{oldClient::(::); oldTm::(::); aws.upload[;"bucket";"key";"/tmp";::] each freshTms};"unable to read file: /tmp";::]
 t.assertTrue[{aws.shutDown[::]};::]
 
 t.feature `initializeWithParams

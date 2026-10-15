@@ -1,16 +1,21 @@
 // AWS headers first; the project headers below pull in k.h, which must come last.
+#include <fstream>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include <aws/core/utils/memory/AWSMemory.h>
 #include <aws/s3/S3Client.h>
+#include <aws/s3/model/GetObjectRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/Object.h>
 #include <aws/s3/model/ObjectStorageClass.h>
+#include <aws/s3/model/PutObjectRequest.h>
 
 #include "aws_session.h"
 #include "s3_client_handle.h"
+#include "s3_files.h"
 #include "s3_objects.h"
 #include "utils.h"
 
@@ -20,14 +25,6 @@ namespace awssdk {
 namespace {
 
 const char * const list_options[] = { "prefix", "startAfter", "marker" };
-
-// An S3 API failure, reported to q with the detail the service gave. Callers
-// log this text, so it carries the exception name and message rather than one
-// of the short tokens used for bad arguments.
-std::string s3_error(const Aws::S3::S3Error & error) {
-    return std::string(error.GetExceptionName().c_str()) + ": "
-        + error.GetMessage().c_str();
-}
 
 // q timestamps count nanoseconds from 2000.01.01, so an epoch-millisecond
 // value has to be rebased as well as scaled. A DateTime the service left unset
@@ -146,13 +143,7 @@ K key_table(const std::vector<Aws::S3::Model::Object> & objects) {
 }  // namespace
 
 K listObjects(K client, K bucket, K options) {
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    // 101 is the generic null, which is how a caller passes "no options".
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         const std::vector<Aws::S3::Model::Object> objects =
@@ -176,12 +167,7 @@ K listObjects(K client, K bucket, K options) {
 }
 
 K listObjectsMetadata(K client, K bucket, K options) {
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         // Owner is requested here but not by listObjects. It needs no second
@@ -220,6 +206,98 @@ K listObjectsMetadata(K client, K bucket, K options) {
         K values = knk(5, sizes, modified, etags, classes, owner_ids);
 
         return xD(key_table(objects), xT(xD(columns, values)));
+    } catch (const std::exception & exc) {
+        return krr_text(exc.what());
+    }
+}
+
+K putObject(K client, K bucket, K key, K filename, K options) {
+    if (const char * error = check_call(options)) { return krr((S)error); }
+
+    try {
+        const ObjectFileArgs args = object_file_args(bucket, key, filename);
+        require_no_options(options);
+        std::shared_ptr<Aws::S3::S3Client> s3 = get_client(client);
+        const long long length = regular_file_size(args.filename);
+
+        std::shared_ptr<Aws::FStream> body = Aws::MakeShared<Aws::FStream>(
+            "awssdk-put-object", args.filename.c_str(),
+            std::ios_base::in | std::ios_base::binary);
+        if (!body->is_open()) { throw file_error("read", args.filename); }
+
+        Aws::S3::Model::PutObjectRequest request;
+        request.SetBucket(args.bucket.c_str());
+        request.SetKey(args.key.c_str());
+        request.SetContentLength(length);
+        request.SetBody(body);
+
+        const auto outcome = s3->PutObject(request);
+        if (!outcome.IsSuccess()) {
+            throw std::runtime_error(s3_error(outcome.GetError()));
+        }
+        return kj(static_cast<J>(length));
+    } catch (const std::exception & exc) {
+        return krr_text(exc.what());
+    }
+}
+
+K getObject(K client, K bucket, K key, K filename, K options) {
+    if (const char * error = check_call(options)) { return krr((S)error); }
+
+    try {
+        const ObjectFileArgs args = object_file_args(bucket, key, filename);
+        const bool in_place = in_place_option(options);
+        std::shared_ptr<Aws::S3::S3Client> s3 = get_client(client);
+        DownloadTarget target(args.filename, in_place);
+
+        Aws::S3::Model::GetObjectRequest request;
+        request.SetBucket(args.bucket.c_str());
+        request.SetKey(args.key.c_str());
+
+        // The SDK owns the returned stream. It may ask for another one when a
+        // request is retried, so the factory always reopens and truncates the
+        // file rather than capturing a single stream instance. `target` is
+        // declared before `outcome`, so it is destroyed after the stream.
+        //
+        // The SDK opens the stream before it knows the status, so in place a
+        // failure has already truncated the destination, and may have left
+        // S3's XML error body in it: marked written, it is removed. A failure
+        // before any response leaves it untouched.
+        const std::string path = target.path();
+        std::shared_ptr<bool> opened = std::make_shared<bool>(false);
+        request.SetResponseStreamFactory([path, opened]() -> Aws::IOStream * {
+            *opened = true;
+            return Aws::New<Aws::FStream>("awssdk-get-object",
+                path.c_str(), std::ios_base::in | std::ios_base::out
+                    | std::ios_base::binary | std::ios_base::trunc);
+        });
+
+        auto outcome = s3->GetObject(request);
+        if (!outcome.IsSuccess()) {
+            if (*opened) { target.mark_written(); }
+            throw std::runtime_error(s3_error(outcome.GetError()));
+        }
+
+        // This is the FStream supplied above. Flush and close it explicitly so
+        // local I/O errors are reported before a temporary replaces the
+        // destination, and so the rename also works on platforms that cannot
+        // rename an open file.
+        Aws::IOStream & response = outcome.GetResult().GetBody();
+        Aws::FStream * output = dynamic_cast<Aws::FStream *>(&response);
+        if (output == nullptr || !output->is_open()) {
+            throw file_error("write", args.filename);
+        }
+        output->flush();
+        const std::streamoff length = output->tellp();
+        const bool wrote = output->good() && length >= 0;
+        output->close();
+        if (!wrote || output->fail()) {
+            target.mark_written();
+            throw file_error("write", args.filename);
+        }
+
+        target.commit();
+        return kj(static_cast<J>(length));
     } catch (const std::exception & exc) {
         return krr_text(exc.what());
     }

@@ -70,9 +70,13 @@ find_package(AWSSDK REQUIRED COMPONENTS ${SERVICE_COMPONENTS})
 add_library(${MY_LIBRARY_NAME} SHARED
         src/aws_credentials.cpp
         src/aws_session.cpp
+        src/event_channel.cpp
         src/module.cpp
+        src/retired.cpp
         src/s3_client.cpp
+        src/s3_files.cpp
         src/s3_objects.cpp
+        src/s3_transfer.cpp
         src/utils.cpp
 )
 
