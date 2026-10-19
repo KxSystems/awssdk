@@ -1,5 +1,5 @@
 context:
-  version: "0.0.4"
+  version: ${{ env.get("PKG_VERSION", default="0.0.0") }}
 
 package:
   name: q-kx-aws-sdk
@@ -44,3 +44,14 @@ tests:
     - if: win
       then:
         - if not exist %PREFIX%\\lib\\q\\mod\\kx\\\awssdk.wi64.dll exit 1
+
+about:
+  homepage: https://github.com/KxSystems/awssdk
+  repository: https://github.com/KxSystems/awssdk
+  license: Apache-2.0
+  license_file: LICENSE
+  summary: kdb-x APIs to authenticate using the AWS C++ SDK.
+  description: >-
+    kdb-x module wrapping the official AWS C++ SDK. Provides AWS credential
+    resolution via the standard AWS authentication chain, S3 client creation,
+    and listing of S3 objects with or without object metadata.
