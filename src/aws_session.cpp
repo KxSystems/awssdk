@@ -5,10 +5,11 @@
 #include <string>
 
 #include <aws/core/platform/FileSystem.h>
+#include <aws/core/utils/logging/AWSLogging.h>
+#include <aws/core/utils/logging/LogSystemInterface.h>
 
 #include "aws_session.h"
 #include "s3_client.h"
-#include "retired.h"
 #include "s3_transfer.h"
 #include "utils.h"
 
@@ -44,13 +45,12 @@ static bool parse_log_level(K options, Aws::Utils::Logging::LogLevel & log_level
   return true;
 }
 
-static void shut_down_at_exit() {
-  // If SDK threads are still busy, the SDK is left running: the process is
-  // ending anyway, and tearing it down under them would be worse.
-  try {
-    AwsSession::getInstance().shutDown();
-  } catch (const std::exception &) {
-  }
+// The SDK is left initialized at exit, as awss3kdb leaves it: its threads may
+// still be running, and ShutdownAPI under them would be worse than not at all.
+// Only its log is flushed, which would otherwise lose whatever is buffered.
+static void flush_log_at_exit() {
+  if (!AwsSession::getInstance().isInitialized()) return;
+  if (auto log = Aws::Utils::Logging::GetLogSystem()) { log->Flush(); }
 }
 
 bool AwsSession::initialize(K options_k) {
@@ -85,32 +85,21 @@ bool AwsSession::initialize(K options_k) {
   Aws::InitAPI(options);
   initialized = true;
   if (!atexit_registered) {
-    std::atexit(&shut_down_at_exit);
+    std::atexit(&flush_log_at_exit);
     atexit_registered = true;
   }
   return true;
 }
 
-// Must not run while another call into the module is in progress. Every entry
-// point runs on q's main thread, so none can. The SDK's own threads can still
-// be running async transfers, so those are canceled and waited for first: no
-// SDK work may outlive ShutdownAPI.
+// As awss3kdb's shutdownSDK: releases every client and transfer manager, then
+// shuts the SDK down. Refused while an async transfer is running, whose SDK
+// threads would otherwise be working on after ShutdownAPI.
 bool AwsSession::shutDown() {
   if (!initialized) return false;
-  // Handles hold SDK resources, so they have to go before ShutdownAPI.
-  // Transfer managers first: each one holds a client, which would otherwise
-  // outlive the client sweep and be destroyed after ShutdownAPI.
-  cancel_all_async_transfers();
+  if (async_transfers_in_flight()) { throw std::runtime_error("busy"); }
+  // Transfer managers first: each one holds a client.
   destroy_all_transfer_managers();
   destroy_all_clients();
-  // The sweeps hand their objects over to be retired; SDK threads may still
-  // hold them. Every one has to be destroyed, here, before ShutdownAPI: an SDK
-  // thread still holding one is still doing SDK work. If they are not all done
-  // in time, the SDK is left initialized and the caller told, so that a later
-  // shutDown can finish the job. The swept handles stay inert either way.
-  if (!drain_retired(std::chrono::seconds(10))) {
-    throw std::runtime_error("busy");
-  }
   Aws::ShutdownAPI(options);
   initialized = false;
   return true;
@@ -139,7 +128,6 @@ K initialize(K options) {
 
 const char * check_call(K options) {
   if (!AwsSession::getInstance().isInitialized()) { return "uninitialized"; }
-  prune_retired();
   if (options == nullptr || (options->t != XD && options->t != 101)) { return "type"; }
   return nullptr;
 }

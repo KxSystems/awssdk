@@ -8,7 +8,6 @@
 #include <stdexcept>
 
 #include "k.h"
-#include "retired.h"
 
 
 namespace awssdk {
@@ -26,10 +25,6 @@ namespace awssdk {
 //
 // The set is what makes an arbitrary 112h safe to reject rather than
 // dereference.
-//
-// Each object the registry lets go of is retired rather than destroyed here:
-// an SDK thread may still hold a reference, and must not be the one to release
-// it last (retired.h).
 //
 // Main thread only, like everything that reaches it: q calls the module, and
 // runs foreign destructors, on its main thread.
@@ -93,7 +88,7 @@ public:
     void release(K handle) {
         Slot * found = slot(handle);
         if (live_.erase(found) != 0) {
-            if (*found) { retire(std::move(*found)); }
+            found->reset();
             delete found;
         }
     }
@@ -104,7 +99,7 @@ public:
     // Aws::ShutdownAPI.
     void sweep() {
         for (Slot * each : live_) {
-            if (*each) { retire(std::move(*each)); }
+            each->reset();
         }
     }
 

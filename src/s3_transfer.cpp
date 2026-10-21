@@ -1,15 +1,11 @@
 // AWS headers first; the project headers below pull in k.h, which must come last.
-#include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
-#include <vector>
 
 #include <aws/core/client/AsyncCallerContext.h>
 #include <aws/core/utils/memory/AWSMemory.h>
@@ -23,7 +19,6 @@
 #include "aws_session.h"
 #include "event_channel.h"
 #include "handle_registry.h"
-#include "retired.h"
 #include "s3_client_handle.h"
 #include "s3_files.h"
 #include "s3_transfer.h"
@@ -36,42 +31,17 @@ namespace {
 
 using Aws::Transfer::TransferStatus;
 
-// A transfer manager's SDK objects, in destruction order: the manager holds
-// only a raw pointer to the executor, whose destructor joins its threads, so
-// the executor is declared first and outlives it.
-struct ManagerParts {
+struct TransferManagerHandle {
+    // Declared first so that it is destroyed last: the manager holds only a
+    // raw pointer to the executor, whose destructor joins its threads.
     std::shared_ptr<Aws::Utils::Threading::PooledThreadExecutor> executor;
     std::shared_ptr<Aws::Transfer::TransferManager> manager;
     // The manager's own, kept to abort failed uploads with.
     std::shared_ptr<Aws::S3::S3Client> client;
-};
-
-struct TransferManagerHandle {
-    // Allocated with the handle, so that letting go of it allocates nothing.
-    std::shared_ptr<ManagerParts> parts = std::make_shared<ManagerParts>();
     uint64_t part_size = 0;
-
-    // Main thread only, as everything holding one is. Whichever owner lets go
-    // last, the parts are retired rather than destroyed: the SDK's tasks hold
-    // the manager, and it holds its client. They are idle once no task does.
-    ~TransferManagerHandle() {
-        const ManagerParts * raw = parts.get();
-        retire(std::move(parts), [raw]() {
-            return !raw->manager || raw->manager.use_count() == 1;
-        });
-    }
 };
 
 HandleRegistry<TransferManagerHandle> managers("transferManager");
-
-// A download that did not complete still has its file open: the SDK closes it
-// only in the handle's destructor, and Windows cannot delete an open file. So
-// the handle is retired with the temporary, which goes only once the handle has
-// been destroyed, on the main thread, with its file closed.
-void retire_unfinished_download(std::shared_ptr<Aws::Transfer::TransferHandle> handle,
-        std::shared_ptr<DownloadTarget> target) {
-    retire(std::move(handle), nullptr, [target]() mutable { target.reset(); });
-}
 
 // Registered as each transfer manager foreign's destructor.
 K destroy_transfer_manager(K handle) {
@@ -107,21 +77,9 @@ void check_upload_source(const TransferManagerHandle & tm, const std::string & f
 std::shared_ptr<Aws::Transfer::TransferHandle> start_upload(const TransferManagerHandle & tm,
         const ObjectFileArgs & args,
         const std::shared_ptr<const Aws::Client::AsyncCallerContext> & context) {
-    return tm.parts->manager->UploadFile(args.filename.c_str(), args.bucket.c_str(),
+    return tm.manager->UploadFile(args.filename.c_str(), args.bucket.c_str(),
         args.key.c_str(), "application/octet-stream",
         Aws::Map<Aws::String, Aws::String>(), context);
-}
-
-// Blocks the q thread until the SDK has let go of a transfer's handle, for at
-// most a few seconds. A completed download's file can still be open when its
-// status says COMPLETED: up to 5 MB it is fetched in one request whose result
-// owns the file stream, and that result goes only when the SDK's task returns,
-// after the status is set. The task holds the handle until then, so once this
-// is its only owner the file is closed -- which a rename needs on Windows.
-void wait_for_release(const std::shared_ptr<Aws::Transfer::TransferHandle> & handle) {
-    for (int waited = 0; waited < 5000 && handle.use_count() > 1; ++waited) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
 }
 
 // Blocks the q thread until the transfer finishes. WaitUntilFinished also
@@ -148,7 +106,7 @@ std::string abort_failed_upload(const TransferManagerHandle & tm,
     request.SetBucket(transfer.GetBucketName());
     request.SetKey(transfer.GetKey());
     request.SetUploadId(transfer.GetMultiPartId());
-    const auto outcome = tm.parts->client->AbortMultipartUpload(request);
+    const auto outcome = tm.client->AbortMultipartUpload(request);
     return outcome.IsSuccess() ? "" : "; abort failed: " + s3_error(outcome.GetError());
 }
 
@@ -188,21 +146,8 @@ struct AsyncTransfer {
     // threads, the executor's destructor would wait for itself.
     std::shared_ptr<TransferManagerHandle> tm;
     std::shared_ptr<Aws::Transfer::TransferHandle> handle;
-    // Downloads only.
-    std::shared_ptr<DownloadTarget> target;
-
-    // A completed download waiting for the SDK to let go of its handle before
-    // the rename (see deliver). The counts its COMPLETED report carried are
-    // kept in final_transferred and final_total meanwhile.
-    bool awaiting_release = false;
-
-    // Set once the outcome has been acted on -- the temporary renamed or
-    // removed, a failed upload aborted -- by the final report or by shutDown.
-    bool settled = false;
-    TransferStatus final_status = TransferStatus::CANCELED;
-    std::string final_error;
-    J final_transferred = 0;
-    J final_total = 0;
+    // Downloads only. An uncommitted temporary is removed with it.
+    std::unique_ptr<DownloadTarget> target;
 };
 
 // Never destroyed: an entry still here at exit would otherwise be destroyed
@@ -237,48 +182,6 @@ const char * status_name(TransferStatus status) {
     }
 }
 
-// Acts on a transfer's outcome, once. A completed download's temporary is
-// renamed over the destination before the q callback hears of it, and an
-// unsuccessful one's is removed; a failed or canceled multipart upload is
-// aborted. Then hands its SDK objects over to be retired: nothing needed to
-// report the outcome may hold them, since the callback may call shutDown,
-// which has to be able to wait for them.
-void settle(AsyncTransfer & t, TransferStatus status, std::string error,
-        J transferred, J total) {
-    if (t.settled) { return; }
-    // What the SDK reported, deliberately, rather than the outcome below: a
-    // completed download is settled only once its file is closed -- either the
-    // SDK has let go of the handle (deliver), or shutDown has waited for every
-    // task to finish -- so even if the rename then fails, the temporary can be
-    // removed straight away.
-    const bool sdk_completed = status == TransferStatus::COMPLETED;
-    if (sdk_completed && t.target) {
-        t.handle.reset();
-        try {
-            t.target->commit();
-        } catch (const std::exception & exc) {
-            status = TransferStatus::FAILED;
-            error = exc.what();
-        }
-    }
-    if (t.upload && t.tm && t.handle
-            && (status == TransferStatus::FAILED || status == TransferStatus::CANCELED)) {
-        error += abort_failed_upload(*t.tm, *t.handle);
-    }
-    if (t.target && !sdk_completed) {
-        retire_unfinished_download(std::move(t.handle), std::move(t.target));
-    }
-    t.handle.reset();
-    t.target.reset();
-    t.tm.reset();
-
-    t.settled = true;
-    t.final_status = status;
-    t.final_error = error;
-    t.final_transferred = transferred;
-    t.final_total = total;
-}
-
 // Calls the q callback with a report in awss3kdb's shape, so existing callers
 // such as SP's download manager work unchanged. An error in the callback is
 // reported and goes no further: it must not stop other transfers' reports.
@@ -311,71 +214,45 @@ void report(const AsyncTransfer & t, TransferStatus status, J transferred, J tot
     if (result != nullptr) { r0(result); }
 }
 
-// The continuation of a completed download that waited for the SDK to release
-// its handle (see deliver): with the handle gone the file is closed, so the
-// rename happens here, at once. It runs on the main thread wherever retired
-// objects are pruned -- including shutDown's drain -- so no rename is left
-// pending once shutDown returns, to land on a file written after it. Only the
-// report is deferred to q's event loop.
-void settle_released(uint64_t id) {
-    std::map<uint64_t, std::unique_ptr<AsyncTransfer>> & transfers = in_flight();
-    auto found = transfers.find(id);
-    if (found == transfers.end() || !found->second->awaiting_release) { return; }
-    AsyncTransfer & t = *found->second;
-    t.awaiting_release = false;
-    settle(t, TransferStatus::COMPLETED, "", t.final_transferred, t.final_total);
-}
-
 // On the main thread: delivers one report. The first final report for a
 // transfer is its last -- the SDK can report a final status more than once,
 // when parts finish together -- and anything after it is dropped.
 void deliver(uint64_t id, TransferStatus status, J transferred, J total,
-        const std::string & error) {
-    prune_retired();
+        std::string error) {
     std::map<uint64_t, std::unique_ptr<AsyncTransfer>> & transfers = in_flight();
     auto found = transfers.find(id);
     if (found == transfers.end()) { return; }
 
     AsyncTransfer & t = *found->second;
-    if (t.awaiting_release) {
-        // Settled by the release, which then posts the report. A duplicate
-        // COMPLETED, or the report shutDown posts, is dropped meanwhile.
-        return;
-    } else if (!t.settled && !is_final(status)) {
+    if (!is_final(status)) {
         report(t, status, transferred, total, error);
-        return;
-    } else if (!t.settled && status == TransferStatus::COMPLETED && t.target
-            && !t.target->in_place() && t.handle && t.handle.use_count() > 1) {
-        // The SDK may still have the file open: up to 5 MB, the request's
-        // result owns the file stream until the SDK's task returns, which is
-        // after the status is set. The task holds the handle until then. So
-        // the handle is retired, and its release settles the transfer
-        // (settle_released) and posts the report, which then comes back here
-        // and is delivered from q's event loop, like every other report,
-        // rather than from inside retirement. The manager is not needed again.
-        t.awaiting_release = true;
-        t.final_transferred = transferred;
-        t.final_total = total;
-        t.tm.reset();
-        retire(std::move(t.handle), nullptr, [id]() {
-            settle_released(id);
-            post_to_main([id]() {
-                deliver(id, TransferStatus::COMPLETED, 0, 0, "");
-            });
-        });
         return;
     }
 
-    // Settled already if shutDown got there first, in which case this report
-    // may be an older one queued before it: the outcome and the counts it
-    // carries are replaced by the settled ones.
-    settle(t, status, error, transferred, total);
+    // A completed download's temporary replaces the destination before the
+    // callback hears of it; a failed or canceled multipart upload is aborted.
+    if (status == TransferStatus::COMPLETED && t.target) {
+        try {
+            t.target->commit();
+        } catch (const std::exception & exc) {
+            status = TransferStatus::FAILED;
+            error = exc.what();
+        }
+    }
+    if (t.upload && (status == TransferStatus::FAILED || status == TransferStatus::CANCELED)) {
+        error += abort_failed_upload(*t.tm, *t.handle);
+    }
+
     // Out of the registry before the callback runs, which may call back into
-    // the module. Destroyed after it, which releases the callback.
+    // the module, and with its SDK objects released: the callback may call
+    // shutDown, which must not find them still held here. The target goes with
+    // them, removing the temporary of a download that did not complete.
     std::unique_ptr<AsyncTransfer> done = std::move(found->second);
     transfers.erase(found);
-    report(*done, done->final_status, done->final_transferred, done->final_total,
-        done->final_error);
+    done->target.reset();
+    done->handle.reset();
+    done->tm.reset();
+    report(*done, status, transferred, total, error);
 }
 
 // The manager's status callback, on whichever SDK thread reported. Copies the
@@ -459,11 +336,10 @@ K createTransferManager(K client, K threads, K options) {
 
         std::shared_ptr<TransferManagerHandle> handle =
             std::make_shared<TransferManagerHandle>();
-        ManagerParts & parts = *handle->parts;
-        parts.executor = Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>(
+        handle->executor = Aws::MakeShared<Aws::Utils::Threading::PooledThreadExecutor>(
             "awssdk-transfer", static_cast<size_t>(threads->j));
 
-        Aws::Transfer::TransferManagerConfiguration config(parts.executor.get());
+        Aws::Transfer::TransferManagerConfiguration config(handle->executor.get());
         // The manager keeps the client alive, so the q client handle can be
         // dropped while this one is still in use.
         config.s3Client = s3;
@@ -472,8 +348,8 @@ K createTransferManager(K client, K threads, K options) {
         config.transferBufferMaxHeapSize =
             config.bufferSize * static_cast<uint64_t>(threads->j);
         config.transferStatusUpdatedCallback = on_transfer_status;
-        parts.manager = Aws::Transfer::TransferManager::Create(config);
-        parts.client = s3;
+        handle->manager = Aws::Transfer::TransferManager::Create(config);
+        handle->client = s3;
         handle->part_size = config.bufferSize;
 
         return managers.wrap(handle, destroy_transfer_manager);
@@ -510,23 +386,16 @@ K download(K manager, K bucket, K key, K filename, K options) {
         const ObjectFileArgs args = object_file_args(bucket, key, filename);
         const bool in_place = in_place_option(options);
         std::shared_ptr<TransferManagerHandle> tm = managers.get(manager);
-        std::shared_ptr<DownloadTarget> target =
-            std::make_shared<DownloadTarget>(args.filename, in_place);
+        // On failure its destructor removes the temporary.
+        DownloadTarget target(args.filename, in_place);
 
-        std::shared_ptr<Aws::Transfer::TransferHandle> transfer = tm->parts->manager->DownloadFile(
-            args.bucket.c_str(), args.key.c_str(), target->path().c_str());
+        std::shared_ptr<Aws::Transfer::TransferHandle> transfer = tm->manager->DownloadFile(
+            args.bucket.c_str(), args.key.c_str(), target.path().c_str());
         if (!finished_ok(transfer)) {
-            const std::string error = s3_error(transfer->GetLastError());
-            retire_unfinished_download(std::move(transfer), target);
-            throw std::runtime_error(error);
+            throw std::runtime_error(s3_error(transfer->GetLastError()));
         }
-        // Past the bound the rename is tried anyway, which works wherever an
-        // open file can be renamed.
-        wait_for_release(transfer);
-        const J bytes = static_cast<J>(transfer->GetBytesTotalSize());
-        transfer.reset();
-        target->commit();
-        return kj(bytes);
+        target.commit();
+        return kj(static_cast<J>(transfer->GetBytesTotalSize()));
     } catch (const std::exception & exc) {
         return krr_text(exc.what());
     }
@@ -570,8 +439,7 @@ K downloadAsync(K manager, K bucket, K key, K filename, K options) {
         std::shared_ptr<TransferManagerHandle> tm = managers.get(manager);
         // Probes the destination now, so an unwritable one is reported here
         // rather than through the callback.
-        std::shared_ptr<DownloadTarget> target =
-            std::make_shared<DownloadTarget>(args.filename, in_place);
+        std::unique_ptr<DownloadTarget> target(new DownloadTarget(args.filename, in_place));
         attach_event_channel();
 
         const std::pair<uint64_t, AsyncTransfer *> started =
@@ -579,7 +447,7 @@ K downloadAsync(K manager, K bucket, K key, K filename, K options) {
         AsyncTransfer & t = *started.second;
         t.target = std::move(target);
         try {
-            t.handle = tm->parts->manager->DownloadFile(args.bucket.c_str(), args.key.c_str(),
+            t.handle = tm->manager->DownloadFile(args.bucket.c_str(), args.key.c_str(),
                 t.target->path().c_str(), Aws::Transfer::DownloadConfiguration(),
                 std::make_shared<AsyncContext>(started.first));
         } catch (...) {
@@ -592,47 +460,8 @@ K downloadAsync(K manager, K bucket, K key, K filename, K options) {
     }
 }
 
-void cancel_all_async_transfers() {
-    std::map<uint64_t, std::unique_ptr<AsyncTransfer>> & transfers = in_flight();
-
-    // Including managers that only in-flight transfers still hold, the q
-    // handle having been dropped.
-    std::vector<std::shared_ptr<TransferManagerHandle>> active;
-    for (auto & entry : transfers) {
-        const std::shared_ptr<TransferManagerHandle> & tm = entry.second->tm;
-        if (tm && std::find(active.begin(), active.end(), tm) == active.end()) {
-            active.push_back(tm);
-        }
-    }
-    // CancelAll does not wait, and SDK threads must be done before ShutdownAPI.
-    for (auto & tm : active) { tm->parts->manager->CancelAll(); }
-    for (auto & tm : active) { tm->parts->manager->WaitUntilAllFinished(); }
-
-    for (auto & entry : transfers) {
-        AsyncTransfer & t = *entry.second;
-        J transferred = 0;
-        J total = 0;
-        if (t.handle) {
-            transferred = static_cast<J>(t.handle->GetBytesTransferred());
-            total = static_cast<J>(t.handle->GetBytesTotalSize());
-            TransferStatus status = t.handle->GetStatus();
-            if (!is_final(status)) { status = TransferStatus::CANCELED; }
-            const std::string error = status == TransferStatus::FAILED
-                ? s3_error(t.handle->GetLastError()) : "";
-            // Releases its SDK objects, before ShutdownAPI.
-            settle(t, status, error, transferred, total);
-        }
-
-        // Every transfer still gets its final report, which q receives once
-        // its event loop runs again. Any report the SDK posted for it is
-        // delivered first, but carries the settled outcome.
-        const uint64_t id = entry.first;
-        post_to_main([id]() {
-            deliver(id, TransferStatus::CANCELED, 0, 0, "");
-        });
-    }
-    // The last references to any manager no q handle holds go here, joining
-    // its threads.
+bool async_transfers_in_flight() {
+    return !in_flight().empty();
 }
 
 void destroy_all_transfer_managers() {

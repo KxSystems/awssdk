@@ -72,7 +72,6 @@ add_library(${MY_LIBRARY_NAME} SHARED
         src/aws_session.cpp
         src/event_channel.cpp
         src/module.cpp
-        src/retired.cpp
         src/s3_client.cpp
         src/s3_files.cpp
         src/s3_objects.cpp

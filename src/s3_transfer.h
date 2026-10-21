@@ -14,12 +14,8 @@ namespace awssdk {
     // before Aws::ShutdownAPI.
     void destroy_all_transfer_managers();
 
-    // Cancels every async transfer still running and waits for the SDK's
-    // threads to finish with them, settles each one's outcome, and releases
-    // their SDK objects; each transfer's final report reaches its q callback
-    // once q's event loop runs again. Has to run before
-    // destroy_all_transfer_managers.
-    void cancel_all_async_transfers();
+    // Whether any async transfer has yet to deliver its final report.
+    bool async_transfers_in_flight();
 
     K createTransferManager(K client, K threads, K options);
     K upload(K manager, K bucket, K key, K filename, K options);

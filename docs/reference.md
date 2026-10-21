@@ -36,7 +36,7 @@ The default `logPrefix` writes files named `aws_sdk_<date>-<hour>.log` in q's cu
 |`'loglevel`|`loglevel` is present but is not a string, or not one of the values above|
 |`'logPrefix`|`logPrefix`'s directory could not be created|
 
-The module registers an exit handler the first time it initializes, so the SDK is shut down on process exit even if [`shutDown`](#shutdown) is never called.
+The SDK is not shut down at process exit, as with `awss3kdb`; an exit handler only flushes its log file.
 
 **Example:**
 
@@ -55,15 +55,10 @@ sdk.initialize[([loglevel: "asdf"])]
 
 ## shutDown
 
-Shuts down the SDK. Call it before exiting the session.
+Releases every client and transfer manager, then shuts down the SDK, as `awss3kdb`'s `shutdownSDK` did. There is no need to call it before exiting.
 
-**Returns:** `1b` if this call shut down an initialized SDK, `0b` if there was nothing to shut down. Signals `'busy` if SDK threads were still busy, as described below. Any [`createClient`](#createclient) or [`createTransferManager`](#createtransfermanager) handle still held becomes inert — see [`createClient`](#createclient)'s **Returns**.
+**Returns:** `1b` if this call shut down an initialized SDK, `0b` if there was nothing to shut down. Signals `'busy`, and changes nothing, while a transfer started by [`uploadAsync`](#uploadasync) or [`downloadAsync`](#downloadasync) has yet to deliver its final report. Any [`createClient`](#createclient) or [`createTransferManager`](#createtransfermanager) handle still held becomes inert — see [`createClient`](#createclient)'s **Returns**.
 
-`shutDown` must not run while another call into this module is in progress. Every function here runs on q's main thread, so that holds for any q code; it matters only if the module is called from other threads.
-
-Transfers started by [`uploadAsync`](#uploadasync) or [`downloadAsync`](#downloadasync) and still running are canceled, and `shutDown` waits for them to stop before returning. Each one's callback still receives a final report, normally `` `CANCELED ``, once q's event loop next runs: a download through a temporary file leaves no file behind, and a multipart upload is aborted.
-
-The SDK's own threads can still be finishing work for a few moments after a transfer ends. `shutDown` waits up to 10 seconds for them before shutting the SDK down. If they are still busy after that, it signals `'busy` and leaves the SDK initialized, since shutting it down under them is unsafe; every handle is already invalidated, and calling `shutDown` again completes it once they are done. In the unlikely event that the module could not keep track of an SDK object, for example because memory ran out, `shutDown` signals `'busy` from then on, and the SDK is left running until the process exits.
 
 **Example:**
 
@@ -482,8 +477,7 @@ across its threads. As with [`getObject`](#getobject), it is written by default 
 beside `filename`, which replaces the destination after a complete, successful download, so a
 failure leaves an existing destination untouched. The same notes apply: the directory needs free
 space for the whole object, and a symbolic link or an existing file's permissions are not kept.
-After a failure, the temporary is removed once the SDK has closed it: normally before `download`
-returns, otherwise moments after.
+After a failure, the temporary is removed before `download` returns.
 
 With `inPlace`, the ranges are written straight into `filename`, as `awss3kdb` did, for callers
 that track a download by its final path. The size request comes first, so a missing object or a
@@ -592,7 +586,7 @@ transfer manager from [`createTransferManager`](#createtransfermanager).
 The download itself behaves as [`download`](#download) does, including what `inPlace` changes. By
 default the temporary file has already replaced `filename` when the callback receives
 `` `COMPLETED ``, so the callback can read the file. After any other final status the temporary is
-removed once the SDK has closed it: normally before the callback runs, otherwise moments after. An unwritable destination directory is an error from this call; anything that goes wrong
+removed before the callback runs. An unwritable destination directory is an error from this call; anything that goes wrong
 once the download has started is reported to the callback.
 
 Two downloads to the same `filename` at the same time finish in no particular order: either may

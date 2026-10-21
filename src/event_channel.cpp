@@ -41,11 +41,10 @@ void close_socket(Socket s) { close(s); }
 // writing a byte to one end makes q call on_readable for the other.
 //
 // At most one wake-up byte is ever unread, because one is written only when
-// none is pending, so a writer can never find the socket full and block. A
-// blocking writer would be a deadlock risk: shutDown waits on q's main thread
-// for transfer threads that would be waiting for q to read.
+// none is pending, so a writer can never find the socket full and block: an
+// SDK thread blocked on q would stall its transfer manager.
 //
-// Never destroyed: SDK threads, and the retirement helper, can still post while
+// Never destroyed: SDK threads can still post while
 // the process exits, after ordinary statics are gone.
 std::mutex & queue_mutex() {
     static auto * mutex = new std::mutex();
