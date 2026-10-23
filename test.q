@@ -246,6 +246,21 @@ t.assertTrue[{aws.shutDown[::]};::]
 t.assertFalse[{key[hsym `$logDir] ~ ()};::] // dir exists
 t.assertTrue[{any (string key[hsym `$logDir]) like "aws_log_*"}]
 
+t.feature `logTo
+t.before[{logToScript::"logto_test.q"; logToDir::"logto_dir"; rmLogDir logToDir}]
+t.after[{hdel hsym `$logToScript; rmLogDir logToDir}]
+t.assertError[{aws.initialize[([logTo:"stdout"])]};"logTo";::]
+t.assertError[{aws.initialize[([logTo:1])]};"type";::]
+// The SDK's log reaches standard output, and logPrefix is ignored: no log directory is created.
+// Run in a fresh process, since the log destination is fixed when the SDK is initialized.
+t.assertTrue[{
+    (hsym `$logToScript) 0: ("aws:use`kx.awssdk;";
+        "aws.initialize[([loglevel:\"INFO\"; logTo:`console; logPrefix:\"", logToDir, "/aws_\"])];";
+        "exit 0");
+    // Through env: system would take a command starting with "q" for q's own \q.
+    out: system "env q ", logToScript, " -q 2>&1";
+    (any out like "*Initiate AWS SDK*") and () ~ key hsym `$logToDir};::]
+
 t.teardown[]  // runs the final feature's after block
 
 report: t.getReport[];

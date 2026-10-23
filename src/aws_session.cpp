@@ -6,6 +6,7 @@
 
 #include <aws/core/platform/FileSystem.h>
 #include <aws/core/utils/logging/AWSLogging.h>
+#include <aws/core/utils/logging/ConsoleLogSystem.h>
 #include <aws/core/utils/logging/LogSystemInterface.h>
 
 #include "aws_session.h"
@@ -59,9 +60,24 @@ bool AwsSession::initialize(K options_k) {
   if (!parse_log_level(options_k, log_level)) {
     throw std::invalid_argument("loglevel");
   }
+  // "file", the SDK's own log files, or "console": standard output, as awss3kdb
+  // logged, which is where a container's logs are collected.
+  std::string log_to = "file";
+  if (dict_find_str(options_k, "logTo", log_to) == DictLookup::WrongType) {
+    throw std::invalid_argument("type");
+  }
+  if (log_to != "file" && log_to != "console") {
+    throw std::invalid_argument("logTo");
+  }
+
   options.loggingOptions.logLevel = log_level;
-  if (log_level != Aws::Utils::Logging::LogLevel::Off) {
-    // in case it was initialized and shut down before
+  // in case it was initialized and shut down before
+  options.loggingOptions.logger_create_fn = nullptr;
+  if (log_level != Aws::Utils::Logging::LogLevel::Off && log_to == "console") {
+    options.loggingOptions.logger_create_fn = [log_level]() {
+      return Aws::MakeShared<Aws::Utils::Logging::ConsoleLogSystem>("awssdk", log_level);
+    };
+  } else if (log_level != Aws::Utils::Logging::LogLevel::Off) {
     log_prefix.clear();
     options.loggingOptions.defaultLogPrefix = Aws::DEFAULT_LOG_PREFIX;
 

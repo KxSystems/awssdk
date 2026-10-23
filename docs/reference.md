@@ -22,7 +22,8 @@ Initializes the SDK. Must be called before any other function in this module.
 |Name|Type|Default|Description|
 |---|---|---|---|
 |loglevel|string\|symbol|`"INFO"`|AWS SDK log level. One of `OFF`, `FATAL`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`, matched case-insensitively|
-|logPrefix|string|SDK default|Prefix for the SDK's own log files, e.g. `"/tmp/sdk_logs/aws_"`. Ignored when `loglevel` is `OFF`. If it contains a `/` or `\`, that directory is created if missing; failing to create it is an error|
+|logTo|string\|symbol|`"file"`|Where the log goes: `file`, the SDK's log files, or `console`, standard output, which is where a container's logs are collected. Matched case-sensitively|
+|logPrefix|string|SDK default|Prefix for the SDK's own log files, e.g. `"/tmp/sdk_logs/aws_"`. Ignored when `loglevel` is `OFF` or `logTo` is `console`. If it contains a `/` or `\`, that directory is created if missing; failing to create it is an error|
 
 The default `logPrefix` writes files named `aws_sdk_<date>-<hour>.log` in q's current working directory.
 
@@ -32,11 +33,12 @@ The default `logPrefix` writes files named `aws_sdk_<date>-<hour>.log` in q's cu
 
 |Error|Cause|
 |---|---|
-|`'type`|`options` is neither a dict nor `::`, or `logPrefix` is present but not a string|
+|`'type`|`options` is neither a dict nor `::`, or `logTo` or `logPrefix` is present but not a string|
 |`'loglevel`|`loglevel` is present but is not a string, or not one of the values above|
+|`'logTo`|`logTo` is neither `file` nor `console`|
 |`'logPrefix`|`logPrefix`'s directory could not be created|
 
-The SDK is not shut down at process exit, as with `awss3kdb`; an exit handler only flushes its log file.
+The SDK is not shut down at process exit, as with `awss3kdb`; an exit handler only flushes its log.
 
 **Example:**
 
