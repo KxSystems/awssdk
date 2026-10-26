@@ -2,6 +2,10 @@ t:use`kx.test;
 
 t.setup[{
     aws::use`kx.awssdk;
+    // A directory, for the checks that a transfer's source must be a regular file. Writing a
+    // file inside it creates it, on every platform.
+    aDir::"test_q_dir";
+    (hsym `$aDir, "/keep") 1: 0x00;
     rmLogDir::{[d]
         h:hsym `$d;
         if[not 11h ~ type k:key h; :(::)];
@@ -23,6 +27,7 @@ t.assertError[{aws.downloadAsync[::;"bucket";"key";"file";([callback:{x}])]};"un
 t.assertFalse[{aws.shutDown[::]};::]
 
 t.feature `initialize
+t.assertError[{aws.initialize[1]};"type";::]
 t.assertTrue[{aws.initialize[::]};::]
 t.assertFalse[{aws.initialize[::]};::]
 
@@ -70,6 +75,63 @@ t.assertError[{aws.createClient[([profile:"default"])]};"profile";::]
 t.assertMatch[{type aws.createClient[([noSignRequest:1b;profile:"default"])]};112h;::]
 t.assertError[{aws.createClient[([noSignRequest:1b;profile:42])]};"profile";::]
 t.assertError[{aws.createClient[1 2 3]};"type";::]
+// Counts and durations may be any q integer type, in a typed or a mixed value list.
+t.assertMatch[{type aws.createClient[`connectTimeout`requestTimeout!1000 2000h]};112h;::]
+t.assertMatch[{type aws.createClient[`connectTimeout`requestTimeout!1000 2000i]};112h;::]
+t.assertMatch[{type aws.createClient[([region:"eu-west-1";connectTimeout:1000h])]};112h;::]
+t.assertMatch[{type aws.createClient[([region:"eu-west-1";connectTimeout:1000i])]};112h;::]
+t.assertError[{aws.createClient[`connectTimeout`requestTimeout!1000 2000f]};"connectTimeout";::]
+
+t.feature `credentialsFile
+t.before[{
+    credsFile::"test_credentials";
+    writeCreds::{[profiles] (hsym `$credsFile) 0: raze {("[",x,"]"; "aws_access_key_id = id_",x; "aws_secret_access_key = secret_",x)} each profiles}}]
+t.after[{hdel hsym `$credsFile}]
+t.assertMatch[{writeCreds enlist "default"; type aws.createClient[([credentials:credsFile])]};112h;::]
+t.assertMatch[{writeCreds "pq"; type aws.createClient[([credentials:credsFile;profile:"p"])]};112h;::]
+// A file holding a single profile, as a mounted secret usually does, needs no profile named.
+t.assertMatch[{writeCreds enlist "only"; type aws.createClient[([credentials:credsFile])]};112h;::]
+// Several profiles and no [default] is ambiguous, so it is reported rather than guessed at.
+t.assertError[{writeCreds "ab"; aws.createClient[([credentials:credsFile])]};"profile";::]
+// A profile asked for by name has to exist; it never falls back.
+t.assertError[{writeCreds enlist "default"; aws.createClient[([credentials:credsFile;profile:"missing"])]};"profile";::]
+t.assertError[{writeCreds enlist "only"; aws.createClient[([credentials:credsFile;profile:"missing"])]};"profile";::]
+
+t.feature `requestFailures
+// A client pointed at a port nothing listens on: every request fails at once, with no S3
+// server needed, which reaches each function's error reporting. The SDK reads its retry
+// settings from the environment when a client is created; a single attempt stops it
+// spending 25 seconds backing off before each failure.
+t.before[{
+    aws.initialize[::];
+    retryEnv: `AWS_RETRY_MODE`AWS_MAX_ATTEMPTS;
+    saved: getenv each retryEnv;
+    retryEnv setenv' ("standard"; enlist "1");
+    down::aws.createClient[([region:"us-east-1";endpointUrl:"http://127.0.0.1:9";virtualAddressing:0b;noSignRequest:1b])];
+    retryEnv setenv' saved;
+    downTm::aws.createTransferManager[down;1;::];
+    srcFile::"test_request_source.txt";
+    (hsym `$srcFile) 0: enlist "data";
+    dstFile::"test_request_destination.txt";
+    // The request was made, and failed to connect. The SDK words that according to its HTTP
+    // client: curl, as on Linux and macOS, gives "curlCode: 7, Could not connect to server; ..."
+    // (7 is CURLE_COULDNT_CONNECT); the Windows clients give exactly the message below.
+    // Either is accepted on any platform, since a Windows build can also use curl.
+    refused::{[f]
+        r: @[f; ::; {x}];
+        (10h = type r) and (r like "curlCode: 7, *") or r ~ "Encountered network error when sending http request"}}]
+t.after[{hdel hsym `$srcFile; @[hdel; hsym `$dstFile; ::]}]
+// The check itself: an argument error is not a failed request.
+t.assertFalse[{refused {aws.listObjects[down;42;::]}};::]
+t.assertTrue[{refused {aws.listObjects[down;"bucket";::]}};::]
+t.assertTrue[{refused {aws.listObjectsMetadata[down;"bucket";::]}};::]
+t.assertTrue[{refused {aws.putObject[down;"bucket";"key";srcFile;::]}};::]
+t.assertTrue[{refused {aws.upload[downTm;"bucket";"key";srcFile;::]}};::]
+// A failed download leaves nothing at the destination, by default or in place.
+t.assertTrue[{(refused {aws.getObject[down;"bucket";"key";dstFile;::]}) and () ~ key hsym `$dstFile};::]
+t.assertTrue[{(refused {aws.getObject[down;"bucket";"key";dstFile;([inPlace:1b])]}) and () ~ key hsym `$dstFile};::]
+t.assertTrue[{(refused {aws.download[downTm;"bucket";"key";dstFile;::]}) and () ~ key hsym `$dstFile};::]
+t.assertTrue[{(refused {aws.download[downTm;"bucket";"key";dstFile;([inPlace:1b])]}) and () ~ key hsym `$dstFile};::]
 
 t.feature `shutDown
 t.assertTrue[{aws.shutDown[::]};::]
@@ -79,7 +141,7 @@ t.assertError[{aws.createClient[::]};"uninitialized";::]
 t.feature `listObjects
 // Argument and option validation only: everything here is rejected before any
 // request is made, so these need no S3 endpoint. The listing itself is covered
-// by the live tests against MinIO.
+// by test_live.q, which needs one.
 t.before[{aws.initialize[::];lo::aws.createClient[::]}]
 // `::` options reach get_client, which proves dict_unknown_key and the three
 // dict_find_str calls all ran against a 101h generic null without treating it
@@ -120,7 +182,7 @@ t.assertError[{aws.getObject[ot;"bucket";"key";"file";([versionId:"1"])]};"versi
 t.assertError[{aws.putObject[ot;"bucket";"key";"/no/such/awssdk-input";()!()]};"unable to read file: /no/such/awssdk-input";::]
 // A directory opens as a stream on Linux and claims a size of INT64_MAX, so it
 // has to be rejected as not a regular file rather than sent.
-t.assertError[{aws.putObject[ot;"bucket";"key";"/tmp";::]};"unable to read file: /tmp";::]
+t.assertError[{aws.putObject[ot;"bucket";"key";aDir;::]};"unable to read file: test_q_dir";::]
 // The destination directory is probed before the request, so a local path
 // failure also avoids an unnecessary network call.
 t.assertError[{aws.getObject[ot;"bucket";"key";"/no/such/awssdk-dir/output";::]};"unable to write file: /no/such/awssdk-dir/output";::]
@@ -160,7 +222,7 @@ t.assertError[{aws.upload[tm;"bucket";"key";"file";([inPlace:1b])]};"inPlace";::
 t.assertError[{aws.download[tm;"bucket";"key";"file";([partSize:1])]};"partSize";::]
 t.assertError[{aws.download[tm;"bucket";"key";"file";([inPlace:"yes"])]};"inPlace";::]
 // The manager opens the upload source itself, so it is checked first.
-t.assertError[{aws.upload[tm;"bucket";"key";"/tmp";::]};"unable to read file: /tmp";::]
+t.assertError[{aws.upload[tm;"bucket";"key";aDir;::]};"unable to read file: test_q_dir";::]
 t.assertError[{aws.upload[tm;"bucket";"key";"/no/such/awssdk-input";::]};"unable to read file: /no/such/awssdk-input";::]
 // Over 10,000 parts of 5 MB is rejected before anything is sent. A sparse
 // file has the size without the disk space.
@@ -171,7 +233,7 @@ t.assertError[{aws.download[tm;"bucket";"key";"/no/such/awssdk-dir/output";([inP
 t.feature `asyncTransfer
 // Everything an async transfer rejects before starting, so none of these
 // reaches S3. Reports arrive only once q's event loop runs, after this script,
-// so delivery is covered by the live tests against MinIO.
+// so delivery is covered by test_live.q.
 t.before[{tm::aws.createTransferManager[aws.createClient[::];2;::]}]
 // The callback is required, and has to be something q can apply.
 t.assertError[{aws.downloadAsync[tm;"bucket";"key";"file";::]};"callback";::]
@@ -190,7 +252,7 @@ t.assertError[{aws.downloadAsync[tm;"bucket";42;"file";([callback:{x}])]};"key";
 t.assertError[{aws.downloadAsync[tm;"bucket";"key";42;([callback:{x}])]};"filename";::]
 // The same local checks as the blocking functions, raised at the call rather
 // than reported through the callback.
-t.assertError[{aws.uploadAsync[tm;"bucket";"key";"/tmp";([callback:{x}])]};"unable to read file: /tmp";::]
+t.assertError[{aws.uploadAsync[tm;"bucket";"key";aDir;([callback:{x}])]};"unable to read file: test_q_dir";::]
 t.assertError[{aws.uploadAsync[tm;"bucket";"key";"/no/such/awssdk-input";([callback:{x}])]};"unable to read file: /no/such/awssdk-input";::]
 t.assertError[{system "truncate -s 60G awssdk_test_sparse"; r:@[aws.uploadAsync[tm;"bucket";"key";;([callback:{x}])]; "awssdk_test_sparse"; {hdel `:awssdk_test_sparse; 'x}]; hdel `:awssdk_test_sparse; r};"unable to upload file: awssdk_test_sparse needs more than 10000 parts of 5 MB";::]
 t.assertError[{aws.downloadAsync[tm;"bucket";"key";"/no/such/awssdk-dir/output";([callback:{x}])]};"unable to write file: /no/such/awssdk-dir/output";::]
@@ -221,19 +283,20 @@ t.assertError[{aws.listObjects[oldClient;"bucket";::]};"client";::]
 t.assertError[{aws.putObject[oldClient;"bucket";"key";"file";::]};"client";::]
 t.assertError[{aws.getObject[oldClient;"bucket";"key";"file";::]};"client";::]
 t.assertError[{aws.createTransferManager[oldClient;1;::]};"client";::]
-t.assertError[{aws.upload[oldTm;"bucket";"key";"/tmp";::]};"transferManager";::]
+t.assertError[{aws.upload[oldTm;"bucket";"key";aDir;::]};"transferManager";::]
 t.assertError[{aws.download[oldTm;"bucket";"key";"file";::]};"transferManager";::]
-t.assertError[{aws.uploadAsync[oldTm;"bucket";"key";"/tmp";([callback:{x}])]};"transferManager";::]
+t.assertError[{aws.uploadAsync[oldTm;"bucket";"key";aDir;([callback:{x}])]};"transferManager";::]
 t.assertError[{aws.downloadAsync[oldTm;"bucket";"key";"file";([callback:{x}])]};"transferManager";::]
 // Dropping the old handles frees only their own slots: every fresh handle
 // still resolves. A manager lookup precedes the file check, so the file error
 // shows the manager was found.
 t.assertTrue[{oldClient::(::); oldTm::(::); all 112h=type each aws.createTransferManager[;1;::] each freshClients};::]
-t.assertError[{oldClient::(::); oldTm::(::); aws.upload[;"bucket";"key";"/tmp";::] each freshTms};"unable to read file: /tmp";::]
+t.assertError[{oldClient::(::); oldTm::(::); aws.upload[;"bucket";"key";aDir;::] each freshTms};"unable to read file: test_q_dir";::]
 t.assertTrue[{aws.shutDown[::]};::]
 
 t.feature `initializeWithParams
 t.assertError[{aws.initialize[([loglevel:"asdf"])]};"loglevel";::]
+t.assertError[{aws.initialize[([loglevel:1])]};"loglevel";::]
 t.assertTrue[{aws.initialize[([loglevel:"DEBUG"])]};::]
 t.assertTrue[{aws.shutDown[::]};::]
 
@@ -241,6 +304,8 @@ t.feature `logPrefix
 t.before[{logDir::"test_log"; logPrefix::logDir,"/aws_log_"; rmLogDir logDir}]
 t.after[{rmLogDir logDir}]
 t.assertError[{aws.initialize[([logPrefix:1234])]};"type";::]
+// A log directory that cannot be created, here because its parent is a file.
+t.assertError[{`:test_log_file 1: 0x00; r: @[aws.initialize; ([logPrefix:"test_log_file/sub/aws_"]); {x}]; hdel `:test_log_file; 'r};"logPrefix";::]
 t.assertTrue[{aws.initialize[([logPrefix:logPrefix])]};::]
 t.assertTrue[{aws.shutDown[::]};::]
 t.assertFalse[{key[hsym `$logDir] ~ ()};::] // dir exists
@@ -257,11 +322,13 @@ t.assertTrue[{
     (hsym `$logToScript) 0: ("aws:use`kx.awssdk;";
         "aws.initialize[([loglevel:\"INFO\"; logTo:`console; logPrefix:\"", logToDir, "/aws_\"])];";
         "exit 0");
-    // Through env: system would take a command starting with "q" for q's own \q.
-    out: system "env q ", logToScript, " -q 2>&1";
+    // Through a shell: system would take a command starting with "q" for q's own \q.
+    out: system $[.z.o like "w*"; "cmd /c q "; "env q "], logToScript, " -q 2>&1";
     (any out like "*Initiate AWS SDK*") and () ~ key hsym `$logToDir};::]
 
 t.teardown[]  // runs the final feature's after block
+hdel `:test_q_dir/keep;
+hdel `:test_q_dir;
 
 report: t.getReport[];
 params:.Q.opt .z.x;
