@@ -4,6 +4,7 @@
 #include "aws_credentials.h"
 #include "s3_client.h"
 #include "s3_objects.h"
+#include "s3_transfer.h"
 #include "k.h"
 
 #ifdef _WIN32
@@ -23,6 +24,13 @@ extern "C" {
     ADD_FN(createClient, 1)
     ADD_FN(listObjects, 3)
     ADD_FN(listObjectsMetadata, 3)
+    ADD_FN(putObject, 5)
+    ADD_FN(getObject, 5)
+    ADD_FN(createTransferManager, 3)
+    ADD_FN(upload, 5)
+    ADD_FN(download, 5)
+    ADD_FN(uploadAsync, 5)
+    ADD_FN(downloadAsync, 5)
     return xD(keys, values);
   }
 }

@@ -1,11 +1,8 @@
 // AWS headers first; the project headers below pull in k.h, which must come last.
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <set>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #include <aws/core/Region.h>
 #include <aws/core/auth/AWSCredentials.h>
@@ -15,6 +12,7 @@
 #include <aws/s3/S3ClientConfiguration.h>
 
 #include "aws_session.h"
+#include "handle_registry.h"
 #include "s3_client.h"
 #include "s3_client_handle.h"
 #include "utils.h"
@@ -30,44 +28,11 @@ const char * const client_options[] = {
     "connectTimeout", "requestTimeout", "maxConnections"
 };
 
-// Each client is held in its own heap slot, and a handle points straight at
-// that slot. The slot is freed only by the foreign's own destructor, so its
-// address can never be recycled while a handle still names it -- which is why
-// pointer identity is safe here. shutDown therefore *releases* each client
-// without freeing its slot: freeing them would hand those addresses to the
-// next client while stale handles still pointed at them, and dropping such a
-// handle would then destroy the wrong client.
-//
-// The set is what makes an arbitrary 112h safe to reject rather than
-// dereference.
-using ClientSlot = std::shared_ptr<Aws::S3::S3Client>;
-std::set<ClientSlot *> live_clients;
+HandleRegistry<Aws::S3::S3Client> clients("client");
 
-// Guarded because the three paths that touch the registry -- createClient, the
-// foreign destructor q runs at garbage collection, and the shutDown sweep --
-// are serial only while q calls this module from one thread. Enabling setm(1)
-// for the async callbacks lifts that guarantee.
-std::mutex live_clients_mutex;
-
-// A real pointer round-tripping through the foreign's payload slot, so this is
-// a well-defined pointer-to-pointer cast -- static_cast cannot express it,
-// since K is an unrelated object pointer type.
-ClientSlot * client_slot(K handle) {
-    return reinterpret_cast<ClientSlot *>(kK(handle)[1]);
-}
-
-// Registered as the foreign's destructor, so q calls it when the last
-// reference goes. This is the only place a slot is freed.
-K destroy_client(K client) {
-    ClientSlot * slot = client_slot(client);
-    bool owned = false;
-    {
-        std::lock_guard<std::mutex> lock(live_clients_mutex);
-        owned = live_clients.erase(slot) != 0;
-    }
-    // Freed outside the lock: releasing a client runs SDK teardown, which must
-    // not happen with the registry held.
-    if (owned) { delete slot; }
+// Registered as each client foreign's destructor.
+K destroy_client(K handle) {
+    clients.release(handle);
     return (K)0;
 }
 
@@ -92,20 +57,7 @@ constexpr J UNSIGNED_FIELD_MAX = static_cast<J>(std::numeric_limits<unsigned>::m
 }  // namespace
 
 K createClient(K options) {
-    // This check and the client construction below are not one atomic step: a
-    // shutDown running in between would call Aws::ShutdownAPI while a client
-    // is still being built. That is safe only because q calls this module from
-    // a single thread, so createClient and shutDown cannot overlap. Step 5
-    // enables setm(1) for the async callbacks and removes that guarantee, at
-    // which point the session needs a read/write guard held across the whole
-    // of any operation that uses the SDK -- not just this one.
-    if (!AwsSession::getInstance().isInitialized()) {
-        return krr("uninitialized");
-    }
-    // 101 is the generic null, which is how createClient[::] passes "no options".
-    if (options == nullptr || (options->t != XD && options->t != 101)) {
-        return krr("type");
-    }
+    if (const char * error = check_call(options)) { return krr((S)error); }
 
     try {
         const char * unknown = dict_unknown_key(options, client_options,
@@ -226,63 +178,18 @@ K createClient(K options) {
             client = std::make_shared<Aws::S3::S3Client>(s3_config);
         }
 
-        // The unique_ptr keeps owning the slot until *both* the registry
-        // insertion and the foreign have succeeded; release() comes last, and
-        // never as an argument to a call that could itself throw.
-        std::unique_ptr<ClientSlot> slot(new ClientSlot(client));
-        {
-            std::lock_guard<std::mutex> lock(live_clients_mutex);
-            live_clients.insert(slot.get());
-        }
-
-        // knk is variadic, so the destructor is passed through untouched; q
-        // reads kK(x)[0] as the destructor and kK(x)[1] as the payload.
-        K foreign = knk(2, destroy_client, slot.get());
-        if (foreign == nullptr) {
-            std::lock_guard<std::mutex> lock(live_clients_mutex);
-            live_clients.erase(slot.get());
-            throw std::runtime_error("alloc");
-        }
-        foreign->t = 112;
-        slot.release();
-        return foreign;
+        return clients.wrap(client, destroy_client);
     } catch (const std::exception & exc) {
         return krr(ss((S)exc.what()));
     }
 }
 
 std::shared_ptr<Aws::S3::S3Client> get_client(K handle) {
-    // n is checked as well as the type: a 112h built elsewhere need not have
-    // two slots, and slot 1 must exist before it can be read.
-    if (handle == nullptr || handle->t != 112 || handle->n != 2) {
-        throw std::invalid_argument("client");
-    }
-
-    std::lock_guard<std::mutex> lock(live_clients_mutex);
-    ClientSlot * slot = client_slot(handle);
-    if (live_clients.find(slot) == live_clients.end()) {
-        throw std::invalid_argument("client");
-    }
-    // Emptied by a shutDown sweep: the handle is still ours, but its client is
-    // gone. Copied, so the caller's operation holds the client alive
-    // independently of the registry.
-    if (!*slot) { throw std::invalid_argument("client"); }
-    return *slot;
+    return clients.get(handle);
 }
 
 void destroy_all_clients() {
-    std::vector<ClientSlot> taken;
-    {
-        std::lock_guard<std::mutex> lock(live_clients_mutex);
-        taken.reserve(live_clients.size());
-        // Emptied, not freed: the slots stay allocated so that handles which
-        // outlive this sweep keep pointing at memory that is still theirs.
-        for (ClientSlot * slot : live_clients) {
-            taken.push_back(*slot);
-            slot->reset();
-        }
-    }
-    // Released outside the lock, as in destroy_client.
+    clients.sweep();
 }
 
 }
