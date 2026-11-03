@@ -5,9 +5,13 @@
 #include <string>
 
 #include <aws/core/platform/FileSystem.h>
+#include <aws/core/utils/logging/AWSLogging.h>
+#include <aws/core/utils/logging/ConsoleLogSystem.h>
+#include <aws/core/utils/logging/LogSystemInterface.h>
 
 #include "aws_session.h"
 #include "s3_client.h"
+#include "s3_transfer.h"
 #include "utils.h"
 
 namespace awssdk {
@@ -42,8 +46,12 @@ static bool parse_log_level(K options, Aws::Utils::Logging::LogLevel & log_level
   return true;
 }
 
-static void shut_down_at_exit() {
-  AwsSession::getInstance().shutDown();
+// The SDK is left initialized at exit, as awss3kdb leaves it: its threads may
+// still be running, and ShutdownAPI under them would be worse than not at all.
+// Only its log is flushed, which would otherwise lose whatever is buffered.
+static void flush_log_at_exit() {
+  if (!AwsSession::getInstance().isInitialized()) return;
+  if (auto log = Aws::Utils::Logging::GetLogSystem()) { log->Flush(); }
 }
 
 bool AwsSession::initialize(K options_k) {
@@ -52,9 +60,24 @@ bool AwsSession::initialize(K options_k) {
   if (!parse_log_level(options_k, log_level)) {
     throw std::invalid_argument("loglevel");
   }
+  // "file", the SDK's own log files, or "console": standard output, as awss3kdb
+  // logged, which is where a container's logs are collected.
+  std::string log_to = "file";
+  if (dict_find_str(options_k, "logTo", log_to) == DictLookup::WrongType) {
+    throw std::invalid_argument("type");
+  }
+  if (log_to != "file" && log_to != "console") {
+    throw std::invalid_argument("logTo");
+  }
+
   options.loggingOptions.logLevel = log_level;
-  if (log_level != Aws::Utils::Logging::LogLevel::Off) {
-    // in case it was initialized and shut down before
+  // in case it was initialized and shut down before
+  options.loggingOptions.logger_create_fn = nullptr;
+  if (log_level != Aws::Utils::Logging::LogLevel::Off && log_to == "console") {
+    options.loggingOptions.logger_create_fn = [log_level]() {
+      return Aws::MakeShared<Aws::Utils::Logging::ConsoleLogSystem>("awssdk", log_level);
+    };
+  } else if (log_level != Aws::Utils::Logging::LogLevel::Off) {
     log_prefix.clear();
     options.loggingOptions.defaultLogPrefix = Aws::DEFAULT_LOG_PREFIX;
 
@@ -78,15 +101,20 @@ bool AwsSession::initialize(K options_k) {
   Aws::InitAPI(options);
   initialized = true;
   if (!atexit_registered) {
-    std::atexit(&shut_down_at_exit);
+    std::atexit(&flush_log_at_exit);
     atexit_registered = true;
   }
   return true;
 }
 
+// As awss3kdb's shutdownSDK: releases every client and transfer manager, then
+// shuts the SDK down. Refused while an async transfer is running, whose SDK
+// threads would otherwise be working on after ShutdownAPI.
 bool AwsSession::shutDown() {
   if (!initialized) return false;
-  // Clients hold SDK resources, so they have to go before ShutdownAPI.
+  if (async_transfers_in_flight()) { throw std::runtime_error("busy"); }
+  // Transfer managers first: each one holds a client.
+  destroy_all_transfer_managers();
   destroy_all_clients();
   Aws::ShutdownAPI(options);
   initialized = false;
@@ -114,8 +142,18 @@ K initialize(K options) {
   }
 }
 
+const char * check_call(K options) {
+  if (!AwsSession::getInstance().isInitialized()) { return "uninitialized"; }
+  if (options == nullptr || (options->t != XD && options->t != 101)) { return "type"; }
+  return nullptr;
+}
+
 K shutDown(K) {
-  return kb(AwsSession::getInstance().shutDown());
+  try {
+    return kb(AwsSession::getInstance().shutDown());
+  } catch (const std::exception & exc) {
+    return krr(ss((S)exc.what()));
+  }
 }
 
 }
