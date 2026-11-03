@@ -1,4 +1,4 @@
-name: q-kx-awssdk
+name: q-kx-aws-sdk
 description: >-
   kdb-x APIs to authenticate using the AWS C++ SDK. 
 homepage: https://github.com/KxSystems/awssdk
